@@ -76,7 +76,7 @@ static void smooth_keys(int64_t *val, uint8_t *ok, uint32_t n, int64_t step)
                     if (within(val[m], val[j] + (int64_t)(m - j) * step, tol * (int64_t)(m - j)))
                         good++;
                 }
-                accept = good >= 2 || (seen < 2 && good == seen);
+                accept = good >= 2 || (seen == 1 && good == 1);
             }
         }
         if (accept) {
