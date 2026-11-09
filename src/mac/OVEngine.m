@@ -141,7 +141,7 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t size, int64_t pos)
     deck = nil;
     [deviceID release];
     deviceID = nil;
-    if (state != OVEngineMerging)
+    if (state != OVEngineMerging && state != OVEngineRetrying)
         state = OVEngineIdle;
 }
 
@@ -168,6 +168,8 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t size, int64_t pos)
     framesSeen++;
     if (state == OVEngineRecording && report && fp) {
         dv_report_feed(report, data, size, pos);
+        if (!report->count) /* out of memory: frame dropped from the report */
+            return;
         f = report->frames[report->count - 1];
         f.sta = NULL;
         if (npoints == cappoints) {
@@ -328,16 +330,21 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t size, int64_t pos)
     baseName = [basePath copy];
     [takes removeAllObjects];
     [takes addObject:path];
-    pthread_mutex_lock(&mtx);
-    [badKeys removeAllIndexes];
-    npoints = 0;
-    lastDataTime = 0;
-    pthread_mutex_unlock(&mtx);
     retryCount = retries;
     noDataTimeout = seconds > 0 ? seconds : 0;
     cancel = NO;
     autoStopDeck = play;
-    [self setState:OVEngineRecording];
+    pthread_mutex_lock(&mtx);
+    [badKeys removeAllIndexes];
+    npoints = 0;
+    lastDataTime = 0;
+    /* switch to recording atomically with a splitter restart, so that the
+     * bytes written to the file and the frame positions start together */
+    dv_splitter_free(&splitter);
+    dv_splitter_init(&splitter);
+    state = OVEngineRecording;
+    pthread_mutex_unlock(&mtx);
+    [self notifyState];
     [self log:[NSString stringWithFormat:@"Recording to %@", path]];
     if (play && deck) {
         OVDeck *d = deck;
@@ -358,7 +365,9 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t size, int64_t pos)
             [self log:@"Retry of bad sections skipped: the device has no AV/C deck control."];
         } else {
             [self setState:OVEngineRetrying];
-            [NSThread detachNewThreadSelector:@selector(retryMain:) toTarget:self withObject:nil];
+            /* the deck is passed so that NSThread keeps it retained while the
+             * worker uses it, even if -disconnect releases the ivar */
+            [NSThread detachNewThreadSelector:@selector(retryMain:) toTarget:self withObject:deck];
             return;
         }
     } else if (retryCount > 0 && !cancel)
@@ -448,7 +457,9 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t size, int64_t pos)
     int dir;
     double t0;
     BOOL shuttle = NO;
-    double lastKnown;
+    double lastKnown, lastCmd;
+    if (target < 0) /* section at the very start of the tape */
+        target = 0;
     if (pos < 0) {
         /* play a moment to learn where we are */
         [deck play];
@@ -468,9 +479,11 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t size, int64_t pos)
         return YES;
     if (dir < 0) [deck rewind]; else [deck fastForward];
     t0 = now_s();
-    lastKnown = t0;
+    lastKnown = lastCmd = t0;
     while (!cancel && now_s() - t0 < 300) {
         usleep(150000);
+        if (now_s() - lastCmd > 2 && [deck state] == OVDeckStopped)
+            break; /* the deck stopped by itself: beginning / end of the tape */
         pos = [self deckTC];
         if (pos < 0) {
             if (now_s() - lastKnown > 6 && dir < 0 && !shuttle) {
@@ -479,7 +492,7 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t size, int64_t pos)
                 usleep(500000);
                 [deck fastReversePlay];
                 shuttle = YES;
-                lastKnown = now_s();
+                lastKnown = lastCmd = now_s();
             } else if (now_s() - lastKnown > 15) {
                 [self log:@"  The deck does not report its position while winding."];
                 [deck stop];

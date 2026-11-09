@@ -190,14 +190,24 @@
     [output recordToOutputFileURL:[NSURL fileURLWithPath:fallbackPath]];
 }
 
+/* The scratch file only exists to get sample buffers flowing: pause it
+ * right away so that it does not grow by 13 GB per hour of tape on the
+ * boot disk (buffers still reach the delegate while paused, 10.6+). */
+- (void)captureOutput:(QTCaptureFileOutput *)o didStartRecordingToOutputFileAtURL:(NSURL *)u forConnections:(NSArray *)c
+{
+    if ([o respondsToSelector:@selector(pauseRecording)])
+        [o pauseRecording];
+}
+
 - (void)captureOutput:(QTCaptureFileOutput *)o didOutputSampleBuffer:(QTSampleBuffer *)sb fromConnection:(QTCaptureConnection *)c
 {
+    /* QTKit capture thread: drain per frame */
+    NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
     NSString *type = [[sb formatDescription] mediaType];
-    if (dvConnection && c != dvConnection && ![[c mediaType] isEqualToString:[dvConnection mediaType]])
-        return;
-    if (type && [type isEqualToString:QTMediaTypeSound])
-        return;
-    [self deliver:[sb bytesForAllSamples] length:[sb lengthForAllSamples]];
+    if ((!dvConnection || c == dvConnection || [[c mediaType] isEqualToString:[dvConnection mediaType]])
+        && !(type && [type isEqualToString:QTMediaTypeSound]))
+        [self deliver:[sb bytesForAllSamples] length:[sb lengthForAllSamples]];
+    [pool release];
 }
 
 - (void)setPreviewHidden:(BOOL)hidden

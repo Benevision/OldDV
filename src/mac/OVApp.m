@@ -390,6 +390,10 @@ static void log_to_main(void *ctx, const char *line)
 
 - (void)deviceNotification:(NSNotification *)n
 {
+    if (![NSThread isMainThread]) { /* not guaranteed to be posted on the main thread */
+        [self performSelectorOnMainThread:@selector(deviceNotification:) withObject:n waitUntilDone:NO];
+        return;
+    }
     [self refreshDevices:nil];
     if ([engine state] == OVEngineIdle)
         [self connect:nil];
@@ -1152,8 +1156,8 @@ static void log_to_main(void *ctx, const char *line)
     appendText(captureLog, [NSString stringWithFormat:@"OldDV Rescue %@ - capture engines: %@%@", OLDDV_VERSION_NS,
                             [OVCaptureBackend qtKitAvailable] ? @"QTKit " : @"",
                             [OVCaptureBackend avFoundationAvailable] ? @"AVFoundation" : @""]);
-    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(deviceNotification:) name:@"QTCaptureDeviceWasConnectedNotification" object:nil];
-    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(deviceNotification:) name:@"QTCaptureDeviceWasDisconnectedNotification" object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(deviceNotification:) name:QTCaptureDeviceWasConnectedNotification object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(deviceNotification:) name:QTCaptureDeviceWasDisconnectedNotification object:nil];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(deviceNotification:) name:@"AVCaptureDeviceWasConnectedNotification" object:nil];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(deviceNotification:) name:@"AVCaptureDeviceWasDisconnectedNotification" object:nil];
     [self refreshDevices:self];
