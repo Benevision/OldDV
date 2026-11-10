@@ -153,9 +153,13 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t size, int64_t pos)
     pthread_mutex_lock(&mtx);
     lastDataTime = now_s();
     if (fp && !retryWindow && state == OVEngineRecording && !writeError) {
-        if (fwrite(bytes, 1, length, fp) != length)
+        int w = dv_writer_write(fp, bytes, length);
+        if (w < 0)
             writeError = 1;
-        fileBytes += (int64_t)length;
+        else if (w == 0)
+            fileBytes += (int64_t)length;
+        else
+            droppedBytes += length; /* buffer full: whole sample dropped */
     }
     dv_splitter_push(&splitter, (const uint8_t *)bytes, length, frame_cb, self);
     pthread_mutex_unlock(&mtx);
@@ -188,8 +192,11 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t size, int64_t pos)
         if (retryWindow && fp && report && !writeError) {
             int64_t k = tc_key(&f);
             if (k >= winStart && k <= winEnd) {
-                if (fwrite(data, 1, size, fp) != size)
+                int w = dv_writer_write(fp, data, size);
+                if (w < 0)
                     writeError = 1;
+                else if (w > 0)
+                    droppedBytes += size;
                 else {
                     dv_report_feed(report, data, size, fileBytes);
                     fileBytes += (int64_t)size;
@@ -220,6 +227,8 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t size, int64_t pos)
         s.recStarts = report->rec_starts;
     }
     s.fileBytes = fileBytes;
+    s.bufferedBytes = fp ? (int64_t)dv_writer_pending(fp) : 0;
+    s.droppedBytes = droppedBytes;
     s.secondsSinceData = lastDataTime ? now_s() - lastDataTime : -1;
     pthread_mutex_unlock(&mtx);
     return s;
@@ -255,9 +264,9 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t size, int64_t pos)
 
 - (BOOL)openFile:(NSString *)path error:(NSString **)err
 {
-    FILE *f = fopen([path fileSystemRepresentation], "wb");
+    dv_writer *f = dv_writer_open([path fileSystemRepresentation], 256u << 20);
     if (!f) {
-        if (err) *err = [NSString stringWithFormat:@"Cannot create %@", path];
+        if (err) *err = [NSString stringWithFormat:@"Cannot create %@ (is the disk / network share mounted and writable?)", path];
         return NO;
     }
     pthread_mutex_lock(&mtx);
@@ -266,6 +275,7 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t size, int64_t pos)
     filePath = [path copy];
     fileBytes = 0;
     writeError = 0;
+    droppedBytes = 0;
     report = (dv_report *)calloc(1, sizeof(dv_report));
     dv_report_init(report, [path fileSystemRepresentation]);
     /* restart frame splitting so that frame positions are file offsets */
@@ -281,13 +291,11 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t size, int64_t pos)
 {
     dv_report *r;
     NSString *path;
+    dv_writer *w;
     pthread_mutex_lock(&mtx);
     dv_splitter_flush(&splitter, frame_cb, self);
-    if (fp) {
-        if (fclose(fp))
-            writeError = 1;
-        fp = NULL;
-    }
+    w = fp;
+    fp = NULL;
     retryWindow = 0;
     r = report;
     report = NULL;
@@ -295,6 +303,17 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t size, int64_t pos)
     if (r)
         r->file_size = fileBytes;
     pthread_mutex_unlock(&mtx);
+    /* drain the buffer outside the lock (can take a while on a share) */
+    if (w) {
+        if (dv_writer_pending(w) > (8u << 20))
+            [self log:[NSString stringWithFormat:@"Writing the last %.0f MB to disk...", dv_writer_pending(w) / 1e6]];
+        if (dv_writer_close(w) < 0)
+            writeError = 1;
+    }
+    if (droppedBytes)
+        [self log:[NSString stringWithFormat:@"WARNING: the destination was too slow, %.1f MB (about %llu frames) were dropped. "
+                   @"Capture to the internal disk, or check the network.", droppedBytes / 1e6,
+                   (unsigned long long)(droppedBytes / 120000)]];
     if (r && path) {
         NSString *xml = [path stringByAppendingString:@".dvrescue.xml"];
         if (dv_report_save_xml([xml fileSystemRepresentation], r))
@@ -402,7 +421,7 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t size, int64_t pos)
     if (state == OVEngineRecording) {
         OVLiveStats s = [self stats];
         if (writeError) {
-            [self log:@"Write error (disk full?): capture stopped."];
+            [self log:@"Write error (disk full, or network share disconnected?): capture stopped."];
             cancel = YES;
             [self finishPass1];
         } else if (noDataTimeout > 0 && s.framesRecorded > 0 && s.secondsSinceData > noDataTimeout) {

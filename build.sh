@@ -32,7 +32,7 @@ rm -rf "$OUT/obj" "$APP"
 mkdir -p "$OUT/obj" "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 OBJS=""
-for f in src/core/dvanalyze.c src/core/dvreport.c src/core/dvmerge.c src/core/dvsplit.c; do
+for f in src/core/dvanalyze.c src/core/dvreport.c src/core/dvmerge.c src/core/dvsplit.c src/core/dvmov.c src/core/dvwriter.c; do
   o="$OUT/obj/$(basename "$f" .c).o"
   $CC $CFLAGS -c "$f" -o "$o"
   OBJS="$OBJS $o"

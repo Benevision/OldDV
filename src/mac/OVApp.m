@@ -207,7 +207,10 @@ static NSString *fmtDuration(uint64_t frames, int pal)
 
     /* package tab */
     NSTextField *packInField, *packOutField, *packMinField, *ffmpegField;
-    NSButton *packRec, *packFormat, *packTC, *packMov, *packButton;
+    NSButton *packSplit, *packRec, *packFormat, *packTC, *packKeepDV, *packMovDV, *packMP4, *packMovH264;
+    NSButton *packDeint, *packSquare, *packButton;
+    NSPopUpButton *packQuality, *afterPopup;
+    BOOL wasRunning;
     NSTextView *packLog;
     NSProgressIndicator *packProgress;
 }
@@ -302,9 +305,15 @@ static void log_to_main(void *ctx, const char *line)
     [retryPopup selectItemAtIndex:[defs integerForKey:@"retries"]];
     mkLabel(v, NSMakeRect(x + 280, y, 260, 18), @"(rewinds the deck, then merges)");
     y -= 26;
-    previewCheck = mkCheck(v, NSMakeRect(x, y, 300, 20), @"Live picture preview", ![defs boolForKey:@"nopreview"]);
+    previewCheck = mkCheck(v, NSMakeRect(x, y, 160, 20), @"Live picture preview", ![defs boolForKey:@"nopreview"]);
     [previewCheck setTarget:self];
     [previewCheck setAction:@selector(previewToggled:)];
+    mkLabel(v, NSMakeRect(x + 175, y, 90, 18), @"Then create:");
+    afterPopup = mkPopup(v, NSMakeRect(x + 262, y - 4, 245, 26), [NSArray arrayWithObjects:
+                         @"nothing more", @".mov (DV, lossless)", @".mp4 (H.264)", @".mov (DV) + .mp4 (H.264)", nil]);
+    [afterPopup selectItemAtIndex:[defs integerForKey:@"after"]];
+    [afterPopup setTarget:self];
+    [afterPopup setAction:@selector(afterChosen:)];
     y -= 48;
     captureButton = mkButton(v, NSMakeRect(x, y, 200, 40), @"Start Capture", self, @selector(toggleCapture:));
     [captureButton setKeyEquivalent:@"\r"];
@@ -501,6 +510,8 @@ static void log_to_main(void *ctx, const char *line)
 
 - (void)engineLogLine:(NSString *)line { appendText(captureLog, line); }
 
+- (void)afterChosen:(id)s { [defs setInteger:[afterPopup indexOfSelectedItem] forKey:@"after"]; }
+
 - (void)engineStateDidChange:(OVEngine *)e
 {
     OVEngineState st = [engine state];
@@ -513,6 +524,9 @@ static void log_to_main(void *ctx, const char *line)
     [nameField setEnabled:!running];
     if (!running && lastCapture && [[NSFileManager defaultManager] fileExistsAtPath:lastCapture])
         [nameField setStringValue:[self defaultName]];
+    if (wasRunning && !running)
+        [self exportAfterCapture];
+    wasRunning = running;
 }
 
 - (void)updateLive
@@ -535,9 +549,11 @@ static void log_to_main(void *ctx, const char *line)
     default: status = @"Not connected";
     }
     [statsLabel setStringValue:[NSString stringWithFormat:
-        @"Status:    %@\nTime code: %s\nRecorded:  %s\nFrames:    %u\nDuration:  %@\nFile size: %@",
+        @"Status:    %@\nTime code: %s\nRecorded:  %s\nFrames:    %u\nDuration:  %@\nFile size: %@%@",
         status, tc[0] ? tc : "--", rd[0] ? rd : "--", s.framesRecorded,
-        fmtDuration(s.framesRecorded, s.haveFrame && s.last.dsf), fmtBytes(s.fileBytes)]];
+        fmtDuration(s.framesRecorded, s.haveFrame && s.last.dsf), fmtBytes(s.fileBytes),
+        s.droppedBytes ? [NSString stringWithFormat:@"\nDROPPED:   %@ (disk too slow)", fmtBytes((int64_t)s.droppedBytes)]
+        : (s.bufferedBytes > 4000000 ? [NSString stringWithFormat:@"\nBuffered:  %@ (disk/share slow)", fmtBytes(s.bufferedBytes)] : @"")]];
     [statsLabel2 setStringValue:[NSString stringWithFormat:
         @"Frames with issues: %u\nTime code breaks:   %u\nNew recordings:     %u\nThis frame: %@%@",
         s.framesWithErrors, s.tcBreaks, s.recStarts,
@@ -953,39 +969,77 @@ static void log_to_main(void *ctx, const char *line)
     [packButton setEnabled:YES];
 }
 
-/* ---------------- package tab ---------------- */
+/* ---------------- package & export tab ---------------- */
 
 - (void)buildPackageTab:(NSView *)v
 {
     CGFloat H = [v bounds].size.height, W = [v bounds].size.width, y = H - 40;
     NSString *ff = [defs stringForKey:@"ffmpeg"];
-    mkLabel(v, NSMakeRect(12, y, 90, 18), @"DV file:");
+    mkLabel(v, NSMakeRect(12, y, 95, 18), @"DV file:");
     packInField = mkField(v, NSMakeRect(110, y - 2, W - 270, 22), @"");
     mkButton(v, NSMakeRect(W - 154, y - 8, 140, 32), @"Choose...", self, @selector(packChooseIn:));
-    y -= 34;
-    mkLabel(v, NSMakeRect(12, y, 90, 18), @"Split at:");
-    packRec = mkCheck(v, NSMakeRect(110, y, 200, 20), @"each new recording", YES);
-    packFormat = mkCheck(v, NSMakeRect(310, y, 200, 20), @"format changes (4:3/16:9, audio)", YES);
-    packTC = mkCheck(v, NSMakeRect(560, y, 200, 20), @"time code breaks", NO);
     y -= 30;
-    mkLabel(v, NSMakeRect(12, y, 300, 18), @"Do not make parts shorter than");
-    packMinField = mkField(v, NSMakeRect(220, y - 2, 60, 22), @"25");
-    mkLabel(v, NSMakeRect(286, y, 100, 18), @"frames");
-    y -= 34;
-    mkLabel(v, NSMakeRect(12, y, 90, 18), @"Output folder:");
+    mkLabel(v, NSMakeRect(12, y, 95, 18), @"Output folder:");
     packOutField = mkField(v, NSMakeRect(110, y - 2, W - 270, 22), @"");
     mkButton(v, NSMakeRect(W - 154, y - 8, 140, 32), @"Choose...", self, @selector(packChooseOut:));
     y -= 34;
-    packMov = mkCheck(v, NSMakeRect(12, y, 330, 20), @"Also rewrap each part to .mov with ffmpeg:", ff != nil);
-    ffmpegField = mkField(v, NSMakeRect(340, y - 2, W - 500, 22), ff ? ff : @"/usr/local/bin/ffmpeg");
+    packSplit = mkCheck(v, NSMakeRect(12, y, 140, 20), @"Split at:", YES);
+    packRec = mkCheck(v, NSMakeRect(150, y, 170, 20), @"each new recording", YES);
+    packFormat = mkCheck(v, NSMakeRect(320, y, 240, 20), @"format changes (4:3/16:9, audio)", YES);
+    packTC = mkCheck(v, NSMakeRect(560, y, 160, 20), @"time code breaks", NO);
+    mkLabel(v, NSMakeRect(720, y, 90, 18), @"min. frames:");
+    packMinField = mkField(v, NSMakeRect(810, y - 2, 50, 22), @"25");
+    y -= 34;
+    mkLabel(v, NSMakeRect(12, y, 95, 18), @"Create:");
+    packKeepDV = mkCheck(v, NSMakeRect(110, y, 200, 20), @".dv (raw, archival)", YES);
+    packMovDV = mkCheck(v, NSMakeRect(320, y, 330, 20), @".mov - DV + PCM, lossless (built in)", [defs boolForKey:@"exp_movdv"]);
+    y -= 24;
+    packMP4 = mkCheck(v, NSMakeRect(110, y, 200, 20), @".mp4 - H.264 + AAC", [defs boolForKey:@"exp_mp4"]);
+    packMovH264 = mkCheck(v, NSMakeRect(320, y, 330, 20), @".mov - H.264 + AAC", [defs boolForKey:@"exp_movh264"]);
+    y -= 30;
+    mkLabel(v, NSMakeRect(12, y, 95, 18), @"H.264:");
+    packQuality = mkPopup(v, NSMakeRect(106, y - 4, 210, 26), [NSArray arrayWithObjects:
+                          @"Best quality (CRF 18)", @"High quality (CRF 20)", @"Good, smaller (CRF 23)", @"Small (CRF 26)", nil]);
+    [packQuality selectItemAtIndex:[defs objectForKey:@"exp_quality"] ? [defs integerForKey:@"exp_quality"] : 1];
+    packDeint = mkCheck(v, NSMakeRect(330, y, 150, 20), @"Deinterlace", ![defs boolForKey:@"exp_nodeint"]);
+    packSquare = mkCheck(v, NSMakeRect(480, y, 330, 20), @"Square pixels (640x480 / 854x480 ...)", ![defs boolForKey:@"exp_anamorphic"]);
+    y -= 30;
+    mkLabel(v, NSMakeRect(12, y, 95, 18), @"Encoder:");
+    ffmpegField = mkField(v, NSMakeRect(110, y - 2, W - 270, 22), ff ? ff : @"");
+    [[ffmpegField cell] setPlaceholderString:@"ffmpeg (bundled, or e.g. /opt/local/bin/ffmpeg from MacPorts)"];
+    mkButton(v, NSMakeRect(W - 154, y - 8, 140, 32), @"Choose...", self, @selector(packChooseFFmpeg:));
     y -= 46;
-    packButton = mkButton(v, NSMakeRect(8, y, 130, 36), @"Split", self, @selector(packRun:));
+    packButton = mkButton(v, NSMakeRect(8, y, 130, 36), @"Start", self, @selector(packRun:));
     packProgress = [[[NSProgressIndicator alloc] initWithFrame:NSMakeRect(150, y + 10, 300, 16)] autorelease];
     [packProgress setIndeterminate:NO];
     [v addSubview:packProgress];
     packLog = mkTextView(v, NSMakeRect(12, 12, W - 24, y - 24), NSViewWidthSizable | NSViewHeightSizable);
-    appendText(packLog, @"Splits a capture into one .dv file per recording (like DVRescue's dvpackager). "
-                        @"Raw .dv opens in QuickTime Player, iMovie and Final Cut on 10.6.");
+    appendText(packLog, @"Split a capture into one file per recording and/or convert it.");
+    appendText(packLog, @"  .dv         raw DV, keep it as the archival master");
+    appendText(packLog, @"  .mov (DV)   same DV video untouched + PCM audio, plays everywhere QuickTime does (13 GB/hour)");
+    appendText(packLog, @"  .mp4/.mov H.264   small files for sharing / Plex (about 1-1.5 GB/hour), needs the ffmpeg encoder");
+    {
+        NSString *enc = [self ffmpegPath];
+        appendText(packLog, enc ? [NSString stringWithFormat:@"H.264 encoder: %@", enc]
+                                : @"H.264 encoder: not found (see README: bundled ffmpeg or MacPorts).");
+    }
+}
+
+/* bundled encoder first, then the configured one, then usual places */
+- (NSString *)ffmpegPath
+{
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *bundled = [[[NSBundle mainBundle] resourcePath] stringByAppendingPathComponent:@"ffmpeg"];
+    NSString *user = [[ffmpegField stringValue] stringByExpandingTildeInPath];
+    NSArray *places = [NSArray arrayWithObjects:@"/opt/local/bin/ffmpeg", @"/usr/local/bin/ffmpeg", @"/sw/bin/ffmpeg", nil];
+    if ([user length] && [fm isExecutableFileAtPath:user])
+        return user;
+    if ([fm isExecutableFileAtPath:bundled])
+        return bundled;
+    for (NSString *p in places)
+        if ([fm isExecutableFileAtPath:p])
+            return p;
+    return nil;
 }
 
 - (void)packChooseIn:(id)s
@@ -1010,13 +1064,52 @@ static void log_to_main(void *ctx, const char *line)
         [packOutField setStringValue:[[[p URLs] objectAtIndex:0] path]];
 }
 
+- (void)packChooseFFmpeg:(id)s
+{
+    NSOpenPanel *p = [NSOpenPanel openPanel];
+    [p setCanChooseFiles:YES];
+    [p setTreatsFilePackagesAsDirectories:YES];
+    if ([p runModal] == NSFileHandlingPanelOKButton) {
+        [ffmpegField setStringValue:[[[p URLs] objectAtIndex:0] path]];
+        [defs setObject:[ffmpegField stringValue] forKey:@"ffmpeg"];
+    }
+}
+
+/* Export options from the Package tab controls */
+- (NSMutableDictionary *)exportOptions
+{
+    static const int crf[4] = { 18, 20, 23, 26 };
+    NSMutableDictionary *o = [NSMutableDictionary dictionary];
+    NSString *ff = [self ffmpegPath];
+    int q = (int)[packQuality indexOfSelectedItem];
+    [defs setInteger:q forKey:@"exp_quality"];
+    [defs setBool:[packDeint state] != NSOnState forKey:@"exp_nodeint"];
+    [defs setBool:[packSquare state] != NSOnState forKey:@"exp_anamorphic"];
+    [o setObject:[NSNumber numberWithInt:crf[q >= 0 && q < 4 ? q : 1]] forKey:@"crf"];
+    [o setObject:[NSNumber numberWithBool:[packDeint state] == NSOnState] forKey:@"deint"];
+    [o setObject:[NSNumber numberWithBool:[packSquare state] == NSOnState] forKey:@"square"];
+    if (ff)
+        [o setObject:ff forKey:@"ffmpeg"];
+    return o;
+}
+
+- (void)startExport:(NSDictionary *)opts
+{
+    busy = YES;
+    [packButton setEnabled:NO];
+    [packProgress setDoubleValue:0];
+    [NSThread detachNewThreadSelector:@selector(exportThread:) toTarget:self withObject:opts];
+}
+
 - (void)packRun:(id)s
 {
     NSString *in = [packInField stringValue], *outDir = [packOutField stringValue];
+    NSMutableDictionary *o;
     int flags = 0;
+    BOOL h264;
     if (busy) { NSBeep(); return; }
     if (![[NSFileManager defaultManager] fileExistsAtPath:in]) {
-        NSRunAlertPanel(@"Split", @"Choose a DV file.", @"OK", nil, nil);
+        NSRunAlertPanel(@"Package & Export", @"Choose a DV file.", @"OK", nil, nil);
         return;
     }
     if (![outDir length])
@@ -1024,51 +1117,173 @@ static void log_to_main(void *ctx, const char *line)
     if ([packRec state] == NSOnState) flags |= DV_SPLIT_REC_START;
     if ([packFormat state] == NSOnState) flags |= DV_SPLIT_FORMAT;
     if ([packTC state] == NSOnState) flags |= DV_SPLIT_TC_BREAK;
-    if ([packMov state] == NSOnState)
+    [defs setBool:[packMovDV state] == NSOnState forKey:@"exp_movdv"];
+    [defs setBool:[packMP4 state] == NSOnState forKey:@"exp_mp4"];
+    [defs setBool:[packMovH264 state] == NSOnState forKey:@"exp_movh264"];
+    if ([[ffmpegField stringValue] length])
         [defs setObject:[ffmpegField stringValue] forKey:@"ffmpeg"];
-    else
-        [defs removeObjectForKey:@"ffmpeg"];
-    busy = YES;
-    [packButton setEnabled:NO];
-    [NSThread detachNewThreadSelector:@selector(packThread:) toTarget:self withObject:
-        [NSArray arrayWithObjects:in, [outDir stringByAppendingPathComponent:[[in lastPathComponent] stringByDeletingPathExtension]],
-         [NSNumber numberWithInt:flags], [NSNumber numberWithInt:[packMinField intValue]],
-         [packMov state] == NSOnState ? [ffmpegField stringValue] : @"", nil]];
+    o = [self exportOptions];
+    h264 = [packMP4 state] == NSOnState || [packMovH264 state] == NSOnState;
+    if (h264 && ![o objectForKey:@"ffmpeg"]) {
+        NSRunAlertPanel(@"H.264 encoder missing",
+                        @"MP4 / H.264 export needs ffmpeg. Use a build of OldDV Rescue that includes it, "
+                        @"install it with MacPorts (sudo port install ffmpeg +gpl2), or choose an ffmpeg binary.", @"OK", nil, nil);
+        return;
+    }
+    if ([packSplit state] != NSOnState && [packKeepDV state] == NSOnState && !h264 && [packMovDV state] != NSOnState) {
+        NSRunAlertPanel(@"Package & Export", @"Nothing to do: tick Split or choose an output format.", @"OK", nil, nil);
+        return;
+    }
+    [o setObject:in forKey:@"in"];
+    [o setObject:outDir forKey:@"dir"];
+    [o setObject:[NSNumber numberWithBool:[packSplit state] == NSOnState] forKey:@"split"];
+    [o setObject:[NSNumber numberWithInt:flags] forKey:@"flags"];
+    [o setObject:[NSNumber numberWithInt:[packMinField intValue]] forKey:@"min"];
+    [o setObject:[NSNumber numberWithBool:[packKeepDV state] == NSOnState] forKey:@"keepdv"];
+    [o setObject:[NSNumber numberWithBool:[packMovDV state] == NSOnState] forKey:@"movdv"];
+    [o setObject:[NSNumber numberWithBool:[packMP4 state] == NSOnState] forKey:@"mp4"];
+    [o setObject:[NSNumber numberWithBool:[packMovH264 state] == NSOnState] forKey:@"movh264"];
+    [self startExport:o];
 }
 
-- (void)packThread:(NSArray *)a
+/* Encode one DV file to H.264 with ffmpeg. Returns YES on success. */
+- (BOOL)encode:(NSString *)dv to:(NSString *)out options:(NSDictionary *)o
+{
+    NSMutableArray *args = [NSMutableArray array];
+    NSMutableArray *vf = [NSMutableArray array];
+    NSTask *t = [[[NSTask alloc] init] autorelease];
+    NSPipe *errPipe = [NSPipe pipe];
+    NSString *errText;
+    BOOL mp4 = [[[out pathExtension] lowercaseString] isEqualToString:@"mp4"];
+    if ([[o objectForKey:@"deint"] boolValue])
+        [vf addObject:@"yadif=0:-1:0"];
+    if ([[o objectForKey:@"square"] boolValue])
+        [vf addObject:@"scale=trunc(ih*dar/2)*2:ih"];
+    [vf addObject:@"setsar=1"];
+    if (![[o objectForKey:@"square"] boolValue])
+        [vf removeLastObject];
+    [args addObjectsFromArray:[NSArray arrayWithObjects:@"-y", @"-nostdin", @"-v", @"error", @"-i", dv,
+                               @"-map", @"0:v:0", @"-map", @"0:a:0?", nil]];
+    if ([vf count])
+        [args addObjectsFromArray:[NSArray arrayWithObjects:@"-vf", [vf componentsJoinedByString:@","], nil]];
+    [args addObjectsFromArray:[NSArray arrayWithObjects:
+        @"-c:v", @"libx264", @"-preset", @"medium", @"-crf", [[o objectForKey:@"crf"] stringValue],
+        @"-pix_fmt", @"yuv420p", @"-c:a", @"aac", @"-b:a", @"192k", @"-ac", @"2", @"-strict", @"-2", nil]];
+    if (mp4)
+        [args addObjectsFromArray:[NSArray arrayWithObjects:@"-movflags", @"+faststart", nil]];
+    [args addObject:out];
+    [t setLaunchPath:[o objectForKey:@"ffmpeg"]];
+    [t setArguments:args];
+    [t setStandardError:errPipe];
+    [t setStandardOutput:[NSFileHandle fileHandleWithNullDevice]];
+    @try {
+        [t launch];
+    } @catch (NSException *e) {
+        log_to_main(self, "  ffmpeg could not be started (check the encoder path).");
+        return NO;
+    }
+    errText = [[[NSString alloc] initWithData:[[errPipe fileHandleForReading] readDataToEndOfFile]
+                                     encoding:NSUTF8StringEncoding] autorelease];
+    [t waitUntilExit];
+    if ([t terminationStatus]) {
+        log_to_main(self, [[NSString stringWithFormat:@"  %@ FAILED: %@", [out lastPathComponent],
+                            errText ? [errText stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] : @""] UTF8String]);
+        [[NSFileManager defaultManager] removeItemAtPath:out error:NULL];
+        return NO;
+    }
+    return YES;
+}
+
+- (void)exportThread:(NSDictionary *)o
 {
     NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-    char *names[2000];
-    NSString *ffmpeg = [a objectAtIndex:4];
-    int n = dv_split_file([[a objectAtIndex:0] fileSystemRepresentation], [[a objectAtIndex:1] fileSystemRepresentation],
-                          [[a objectAtIndex:2] intValue], (uint32_t)[[a objectAtIndex:3] intValue], names, 2000,
-                          log_to_main, progress_to_main, self), i;
-    if (n < 0)
-        log_to_main(self, "Split failed (no DV frames or write error).");
-    for (i = 0; i < n && i < 2000; i++) {
-        if ([ffmpeg length]) {
-            NSString *dv = [NSString stringWithUTF8String:names[i]];
-            NSString *mov = [[dv stringByDeletingPathExtension] stringByAppendingPathExtension:@"mov"];
-            NSTask *t = [[[NSTask alloc] init] autorelease];
-            [t setLaunchPath:ffmpeg];
-            [t setArguments:[NSArray arrayWithObjects:@"-y", @"-v", @"error", @"-i", dv, @"-c", @"copy", @"-f", @"mov", mov, nil]];
-            @try {
-                [t launch];
-                [t waitUntilExit];
-                log_to_main(self, [[NSString stringWithFormat:@"  %@ %@", [mov lastPathComponent],
-                                   [t terminationStatus] ? @"FAILED" : @"written"] UTF8String]);
-            } @catch (NSException *e) {
-                log_to_main(self, "  ffmpeg could not be started (check its path).");
-                ffmpeg = @"";
+    NSString *in = [o objectForKey:@"in"], *dir = [o objectForKey:@"dir"];
+    NSString *base = [dir stringByAppendingPathComponent:[[in lastPathComponent] stringByDeletingPathExtension]];
+    NSMutableArray *parts = [NSMutableArray array];
+    BOOL split = [[o objectForKey:@"split"] boolValue];
+    BOOL keepdv = [[o objectForKey:@"keepdv"] boolValue];
+    BOOL movdv = [[o objectForKey:@"movdv"] boolValue], mp4 = [[o objectForKey:@"mp4"] boolValue];
+    BOOL movh = [[o objectForKey:@"movh264"] boolValue];
+    NSUInteger i;
+    int ok = 0, failed = 0;
+
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:NULL];
+    if (split) {
+        char *names[2000];
+        int n = dv_split_file([in fileSystemRepresentation], [base fileSystemRepresentation],
+                              [[o objectForKey:@"flags"] intValue], (uint32_t)[[o objectForKey:@"min"] intValue],
+                              names, 2000, log_to_main, progress_to_main, self), k;
+        if (n < 0)
+            log_to_main(self, "Split failed (no DV frames or write error).");
+        for (k = 0; k < n && k < 2000; k++) {
+            [parts addObject:[NSString stringWithUTF8String:names[k]]];
+            free(names[k]);
+        }
+    } else
+        [parts addObject:in];
+
+    for (i = 0; i < [parts count]; i++) {
+        NSString *dv = [parts objectAtIndex:i];
+        NSString *b = [dir stringByAppendingPathComponent:[[dv lastPathComponent] stringByDeletingPathExtension]];
+        progress_to_main(self, (double)i / [parts count]);
+        if (movdv) {
+            NSString *mov = [b stringByAppendingString:movh ? @"_dv.mov" : @".mov"];
+            if (dv_write_mov([dv fileSystemRepresentation], 0, 0, [mov fileSystemRepresentation], log_to_main, NULL, self) == 0)
+                ok++;
+            else {
+                failed++;
+                log_to_main(self, [[NSString stringWithFormat:@"  %@ FAILED", [mov lastPathComponent]] UTF8String]);
             }
         }
-        free(names[i]);
+        if (mp4) {
+            NSString *out = [b stringByAppendingPathExtension:@"mp4"];
+            log_to_main(self, [[NSString stringWithFormat:@"Encoding %@ ...", [out lastPathComponent]] UTF8String]);
+            if ([self encode:dv to:out options:o]) { ok++; log_to_main(self, "  done"); } else failed++;
+        }
+        if (movh) {
+            NSString *out = [b stringByAppendingString:movdv ? @"_h264.mov" : @".mov"];
+            log_to_main(self, [[NSString stringWithFormat:@"Encoding %@ ...", [out lastPathComponent]] UTF8String]);
+            if ([self encode:dv to:out options:o]) { ok++; log_to_main(self, "  done"); } else failed++;
+        }
+        if (split && !keepdv && ![dv isEqualToString:in])
+            [[NSFileManager defaultManager] removeItemAtPath:dv error:NULL];
     }
-    if (n >= 0)
-        log_to_main(self, [[NSString stringWithFormat:@"%d part(s) written.", n] UTF8String]);
+    progress_to_main(self, 1.0);
+    log_to_main(self, [[NSString stringWithFormat:@"Finished: %lu part(s), %d file(s) created%@.", (unsigned long)[parts count], ok,
+                        failed ? [NSString stringWithFormat:@", %d FAILED", failed] : @""] UTF8String]);
     [self performSelectorOnMainThread:@selector(jobDone:) withObject:nil waitUntilDone:NO];
     [pool release];
+}
+
+/* Capture tab: convert the finished capture automatically */
+- (void)exportAfterCapture
+{
+    NSInteger what = [afterPopup indexOfSelectedItem];
+    NSString *merged = [[lastCapture stringByDeletingPathExtension] stringByAppendingString:@".merged.dv"];
+    NSString *src = [[NSFileManager defaultManager] fileExistsAtPath:merged] ? merged : lastCapture;
+    NSMutableDictionary *o;
+    if (what <= 0 || !src || ![[NSFileManager defaultManager] fileExistsAtPath:src])
+        return;
+    if (busy) {
+        appendText(captureLog, @"Another job is running: convert the capture later in the Package & Export tab.");
+        return;
+    }
+    o = [self exportOptions];
+    if ((what == 2 || what == 3) && ![o objectForKey:@"ffmpeg"]) {
+        appendText(captureLog, @"MP4 not created: no ffmpeg encoder found (see Package & Export tab).");
+        if (what == 2)
+            return;
+        what = 1;
+    }
+    [o setObject:src forKey:@"in"];
+    [o setObject:[src stringByDeletingLastPathComponent] forKey:@"dir"];
+    [o setObject:[NSNumber numberWithBool:NO] forKey:@"split"];
+    [o setObject:[NSNumber numberWithBool:what == 1 || what == 3] forKey:@"movdv"];
+    [o setObject:[NSNumber numberWithBool:what == 2 || what == 3] forKey:@"mp4"];
+    [o setObject:[NSNumber numberWithBool:NO] forKey:@"movh264"];
+    [packInField setStringValue:src];
+    appendText(captureLog, @"Converting the capture (progress in the Package & Export tab)...");
+    [self startExport:o];
 }
 
 /* ---------------- application ---------------- */
@@ -1113,7 +1328,7 @@ static void log_to_main(void *ctx, const char *line)
 - (void)applicationDidFinishLaunching:(NSNotification *)n
 {
     NSRect frame = NSMakeRect(0, 0, 1000, 720);
-    NSArray *names = [NSArray arrayWithObjects:@"Capture", @"Analyze", @"Merge Takes", @"Package", nil];
+    NSArray *names = [NSArray arrayWithObjects:@"Capture", @"Analyze", @"Merge Takes", @"Package & Export", nil];
     NSArray *ids = [NSArray arrayWithObjects:@"capture", @"analyze", @"merge", @"package", nil];
     NSUInteger i;
     NSDictionary *def = [NSDictionary dictionaryWithObjectsAndKeys:

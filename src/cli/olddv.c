@@ -24,6 +24,8 @@ static void usage(void)
         "                          picking the best blocks of each input\n"
         "      --merge-log FILE    write the merge log to FILE\n"
         "      --split BASE        split the input into BASE_partNNN.dv\n"
+        "      --mov FILE          rewrap the input into a QuickTime .mov\n"
+        "                          (DV video untouched + PCM audio, lossless)\n"
         "      --by LIST           split criteria: rec,format,tc (default rec,format)\n"
         "      --min N             minimum part length in frames (default 1)\n"
         "  -p, --progress          show progress on stderr\n"
@@ -56,7 +58,7 @@ int main(int argc, char **argv)
 {
     const char *inputs[64];
     int ninputs = 0, i, ret = 0;
-    const char *xml_out = NULL, *merge_out = NULL, *merge_log = NULL, *split_base = NULL;
+    const char *mov_out = NULL, *xml_out = NULL, *merge_out = NULL, *merge_log = NULL, *split_base = NULL;
     int summary = 0, csv = 0, split_flags = DV_SPLIT_REC_START | DV_SPLIT_FORMAT;
     unsigned min_frames = 1;
 
@@ -68,6 +70,7 @@ int main(int argc, char **argv)
         else if ((!strcmp(a, "-m") || !strcmp(a, "--merge")) && i + 1 < argc) merge_out = argv[++i];
         else if (!strcmp(a, "--merge-log") && i + 1 < argc) merge_log = argv[++i];
         else if (!strcmp(a, "--split") && i + 1 < argc) split_base = argv[++i];
+        else if (!strcmp(a, "--mov") && i + 1 < argc) mov_out = argv[++i];
         else if (!strcmp(a, "--by") && i + 1 < argc) {
             const char *v = argv[++i];
             split_flags = 0;
@@ -106,6 +109,14 @@ int main(int argc, char **argv)
         if (summary)
             dv_report_write_summary(stdout, &r);
         dv_report_free(&r);
+        return 0;
+    }
+
+    if (mov_out) {
+        if (dv_write_mov(inputs[0], 0, 0, mov_out, log_cb, quiet ? NULL : progress_cb, NULL)) {
+            fprintf(stderr, "Rewrap failed\n");
+            return 1;
+        }
         return 0;
     }
 

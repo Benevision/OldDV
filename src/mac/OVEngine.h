@@ -40,6 +40,8 @@ typedef struct OVLiveStats {
     uint32_t framesWithErrors;
     uint32_t tcBreaks, recStarts;
     int64_t  fileBytes;
+    int64_t  bufferedBytes;  /* waiting to be written (slow disk / share) */
+    uint64_t droppedBytes;   /* lost because the destination was too slow */
     double   secondsSinceData;
 } OVLiveStats;
 
@@ -59,7 +61,8 @@ typedef struct OVLiveStats {
     double lastDataTime;
     double lastTCTime;
 
-    FILE *fp;
+    dv_writer *fp;          /* buffered writer (network shares can stall) */
+    uint64_t droppedBytes;
     NSString *filePath;
     int64_t fileBytes;
     int writeError;

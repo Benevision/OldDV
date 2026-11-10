@@ -239,6 +239,38 @@ int dv_split_file(const char *path, const char *outbase, int flags,
                   uint32_t min_frames, char **names, int max_names,
                   dv_log_cb log, dv_progress_cb progress, void *ctx);
 
+/* --------------------------------------------------------------------- */
+/* Buffered background writer (for slow / network destinations)           */
+
+typedef struct dv_writer dv_writer;
+dv_writer *dv_writer_open(const char *path, size_t buffer_bytes); /* 0 = 256 MB */
+/* 0 queued, 1 dropped (buffer full), -1 write error (disk full, share gone) */
+int    dv_writer_write(dv_writer *w, const void *data, size_t size);
+size_t dv_writer_pending(dv_writer *w);  /* bytes not yet written */
+size_t dv_writer_peak(dv_writer *w);     /* highest buffer use */
+int    dv_writer_error(dv_writer *w);    /* 0 ok, 1 write error, 2 data dropped */
+uint64_t dv_writer_dropped(dv_writer *w);
+int    dv_writer_close(dv_writer *w);    /* flush and close: 0 ok, 1 data was dropped, -1 error */
+
+/* --------------------------------------------------------------------- */
+/* Audio extraction and lossless QuickTime (.mov) rewrap                  */
+
+typedef struct dv_audio_fmt {
+    int dsf;         /* 0 NTSC, 1 PAL */
+    unsigned rate;   /* 48000 / 44100 / 32000 */
+    int quant;       /* 0 = 16 bit, 1 = 12 bit nonlinear */
+    int samples;     /* samples in this frame */
+    int pairs;       /* stereo pairs (2 for 12 bit 4 channels) */
+} dv_audio_fmt;
+
+int  dv_audio_info(const uint8_t *frame, size_t size, dv_audio_fmt *fmt);
+void dv_audio_extract(const uint8_t *frame, size_t size, const dv_audio_fmt *fmt, int pair, int16_t *out);
+
+/* Rewrap bytes [start, end) of a DV file (end <= 0: to the end) into a
+ * QuickTime movie: DV video track + 16-bit PCM audio track(s). */
+int dv_write_mov(const char *in, int64_t start, int64_t end, const char *out,
+                 dv_log_cb log, dv_progress_cb progress, void *ctx);
+
 #ifdef __cplusplus
 }
 #endif

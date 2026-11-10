@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 OLDDV=${1:-build/olddv}
 if [ ! -x "$OLDDV" ]; then
   mkdir -p build
-  cc -std=gnu99 -O2 -D_FILE_OFFSET_BITS=64 -o build/olddv src/cli/olddv.c src/core/*.c -lm
+  cc -std=gnu99 -O2 -D_FILE_OFFSET_BITS=64 -o build/olddv src/cli/olddv.c src/core/*.c -lm -lpthread
   OLDDV=build/olddv
 fi
 W=$(mktemp -d)
@@ -42,5 +42,14 @@ check "merge reduces bad blocks ($b1 -> $bm)" "[ $bm -lt $b1 ]"
 cat "$W/clean.dv" "$W/clean.dv" > "$W/two.dv"
 "$OLDDV" "$W/two.dv" --split "$W/part" --by tc > "$W/parts.txt"
 check "split at time code break gives 2 parts" "[ \$(wc -l < $W/parts.txt) -eq 2 ]"
+
+# lossless QuickTime rewrap: video and audio identical to the DV
+"$OLDDV" "$W/clean.dv" --mov "$W/clean.mov" 2>/dev/null
+v1=$(ffmpeg -v error -i "$W/clean.dv" -map 0:v -f framemd5 - | grep -v '^#' | awk -F, '{print $6}' | md5sum)
+v2=$(ffmpeg -v error -i "$W/clean.mov" -map 0:v -f framemd5 - | grep -v '^#' | awk -F, '{print $6}' | md5sum)
+a1=$(ffmpeg -v error -i "$W/clean.dv" -map 0:a:0 -f s16le - | md5sum)
+a2=$(ffmpeg -v error -i "$W/clean.mov" -map 0:a:0 -f s16le - | md5sum)
+check ".mov rewrap keeps DV video bit-exact" "[ \"$v1\" = \"$v2\" ]"
+check ".mov rewrap audio identical to ffmpeg's DV decode" "[ \"$a1\" = \"$a2\" ]"
 
 [ $fail = 0 ] && echo "All tests passed." || { echo "Some tests failed."; exit 1; }

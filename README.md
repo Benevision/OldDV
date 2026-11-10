@@ -17,7 +17,7 @@ with no dependencies:
 | XML report (`*.dvrescue.xml`) | Same XML format and namespace, so the DVRescue tools can read it |
 | "Rewind and retry" of bad sections (`--rewind-count`) | **Re-read sections with errors** option: rewinds by time code, captures each bad section again, then merges |
 | Merge of several captures, block by block (`--merge`) | **Merge Takes** tab / `olddv -m` |
-| `dvpackager` (split at each recording) | **Package** tab: one `.dv` per recording, optional `.mov` rewrap if you install ffmpeg |
+| `dvpackager` (split at each recording, rewrap to .mov) | **Package & Export** tab: one file per recording. Lossless `.mov` (DV + PCM) is built in; H.264 `.mp4` / `.mov` need ffmpeg. |
 | `dvloupe` / `dvplay` (block error map of a frame) | **Analyze** tab: error timeline, list of bad frames, block map and picture of each frame |
 
 Not included: DeckLink/analog capture, closed caption export (SCC/SRT/WebVTT), MKV output,
@@ -115,12 +115,90 @@ One-off glitches in time code or track number are ignored, so they don't break t
 alignment. For each frame, the take with the fewest bad blocks is used, and each of its
 bad blocks is replaced by a good copy of the same block from another take.
 
-### Package
+### Package & Export
 
-Splits a capture into one `.dv` per recording, and optionally at 4:3/16:9 or audio
-changes and time code breaks. The parts open in QuickTime Player 7/X, iMovie '09 and
-Final Cut. If you have an `ffmpeg` binary, tick the option to also get `.mov` files
-(stream copy, no re-encoding).
+Splits a capture into one file per recording (optionally also at 4:3/16:9 or audio
+changes and at time code breaks), and/or converts it. Untick **Split** to convert the
+whole file.
+
+| Format | What it is | Size | Needs |
+|---|---|---|---|
+| `.dv` | raw DV, your archival master | 13 GB/h | built in |
+| `.mov` (DV) | the same DV video, untouched, plus PCM audio in a QuickTime file. Lossless. Plays in QuickTime 7/X, iMovie, Final Cut, VLC. | 13 GB/h | built in |
+| `.mp4` (H.264) | H.264 video + AAC audio, for sharing, phones, Plex/Jellyfin | ~1–1.5 GB/h | ffmpeg |
+| `.mov` (H.264) | the same, in a QuickTime file | ~1–1.5 GB/h | ffmpeg |
+
+H.264 options:
+* **Quality:** CRF 18 / 20 / 23 / 26 (lower is better and bigger).
+* **Deinterlace:** on by default. DV is interlaced and computers show combing without it.
+* **Square pixels:** on by default. Gives 640×480 / 854×480 for NTSC, 768×576 / 1024×576
+  for PAL. Untick it to keep 720×480 with the aspect ratio flag.
+
+The Capture tab can convert automatically when a capture ends: use **Then create:**
+`.mov (DV)`, `.mp4`, or both.
+
+**Where the encoder comes from.** The app looks, in this order, for:
+1. the path typed in the *Encoder* field;
+2. an `ffmpeg` inside the app (`OldDV Rescue.app/Contents/Resources/ffmpeg`);
+3. MacPorts (`/opt/local/bin/ffmpeg`), then `/usr/local/bin/ffmpeg`.
+
+MacPorts still supports Snow Leopard. Installing ffmpeg with it takes a few hours to
+compile on a Core 2 Duo, but it is the official way to get it:
+
+```bash
+sudo port install ffmpeg +gpl2
+```
+
+The lossless `.mov` was checked with ffmpeg: the DV frames inside are bit-identical to the
+`.dv`, and the audio matches ffmpeg's own DV audio decoding sample for sample. That
+covers 16-bit 48 kHz, 12-bit 32 kHz 4-channel, NTSC and PAL.
+
+## Saving to an Unraid (or other NAS) share
+
+Snow Leopard can't talk to a modern Samba/Unraid share: it only knows SMB1, which Unraid
+turns off by default. Three ways around it, best first:
+
+**1. NFS (recommended).** Mac OS X 10.6 has a built-in NFS client, and Unraid has an NFS server.
+* On Unraid:
+  1. *Settings → NFS*: set *Enable NFS* to **Yes**.
+  2. *Shares → (your share) → NFS Security Settings*: set *Export* to **Yes**.
+  3. Set *Security* to **Public**, or **Private** with the rule
+     `192.168.1.50(sec=sys,rw,insecure)`, using your Mac's IP address.
+* On the Mac:
+  1. In Finder, choose *Go → Connect to Server…* (⌘K).
+  2. Enter `nfs://tower.local/mnt/user/YourShare`, using your server's name or IP. The
+     share appears under `/Volumes/YourShare`.
+  3. In OldDV Rescue, set *Save to* to that folder.
+* To mount it automatically at every start-up: open *Disk Utility → File → NFS Mounts…*,
+  click **+**, enter `nfs://tower.local/mnt/user/YourShare`, and set the mount location
+  to `/Volumes/YourShare`.
+* If the mount fails with a permission error, mount it from Terminal using a privileged
+  port:
+
+  ```bash
+  sudo mkdir -p /Volumes/YourShare
+  ```
+
+  ```bash
+  sudo mount -t nfs -o resvport,rw tower.local:/mnt/user/YourShare /Volumes/YourShare
+  ```
+
+**2. SMB1.** Unraid 6 can turn on SMB1 for old clients: *Settings → SMB → Enable NetBIOS:
+Yes*. Then use *Go → Connect to Server* with `smb://tower.local/YourShare`. It works, but
+SMB1 is slow and insecure, so use it only on your home network. Newer Unraid versions may
+no longer offer this option; use NFS then.
+
+**3. Capture locally, then copy.** Capture to the internal disk (the safest for an
+irreplaceable tape) and copy the files to the share afterwards over NFS or SMB1.
+
+**What OldDV Rescue does to make network capture safe.** The capture data goes into a
+256 MB memory buffer (about 70 seconds of DV), and a separate thread writes it to the
+destination. A share that pauses for a few seconds doesn't cost any frames. The Capture
+tab shows *Buffered: …* when the network falls behind. If it ever falls more than
+70 seconds behind, it shows *DROPPED*, and the log says how many frames were lost.
+
+Wired gigabit Ethernet is plenty, since DV needs only 3.6 MB/s. Wi-Fi works but is less
+reliable.
 
 ## Command line
 
@@ -143,10 +221,15 @@ olddv take1.dv take2.dv take3.dv -m merged.dv --merge-log merge.txt
 olddv tape.dv --split parts/tape --by rec,format --min 25
 ```
 
+```bash
+olddv tape.dv --mov tape.mov
+```
+
 * `-s`: print a summary.
 * `-x`: write the XML report (DVRescue format).
 * `-m`: merge takes, picking the best blocks of each.
 * `--split`: write one file per recording.
+* `--mov`: lossless QuickTime rewrap.
 
 `olddv --help` lists all options, including `--csv`.
 
@@ -188,7 +271,8 @@ messages in the Capture log, or in Console.app, say what went wrong.
 
 ```
 src/core/      portable C: DV analysis (dvanalyze.c), XML/CSV report (dvreport.c),
-               merge (dvmerge.c), packager (dvsplit.c)
+               merge (dvmerge.c), packager (dvsplit.c), lossless .mov writer (dvmov.c),
+               buffered writer for slow/network disks (dvwriter.c)
 src/cli/       olddv command line tool
 src/mac/       Cocoa app: OVApp (window), OVEngine (capture + retries), OVCapture
                (QTKit / AVFoundation), OVDeck (AV/C control), OVViews (graph, block map)
