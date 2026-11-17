@@ -52,4 +52,44 @@ a2=$(ffmpeg -v error -i "$W/clean.mov" -map 0:a:0 -f s16le - | md5sum)
 check ".mov rewrap keeps DV video bit-exact" "[ \"$v1\" = \"$v2\" ]"
 check ".mov rewrap audio identical to ffmpeg's DV decode" "[ \"$a1\" = \"$a2\" ]"
 
+# merge of a tape whose time code restarts (same time codes twice): the
+# first take is the timeline, nothing may be lost or reordered
+python3 tests/inject.py "$W/two.dv" "$W/two_a.dv" 5
+python3 tests/inject.py "$W/two.dv" "$W/two_b.dv" 6
+"$OLDDV" "$W/two.dv" "$W/two_a.dv" -m "$W/two_m.dv" 2>/dev/null
+check "merge with a clean first take returns it unchanged" "cmp -s $W/two.dv $W/two_m.dv"
+"$OLDDV" "$W/two_a.dv" "$W/two_b.dv" "$W/two.dv" -m "$W/two_m2.dv" -s 2>/dev/null > "$W/m2.txt"
+check "merge with repeated time codes keeps all 358 frames" "grep -q 'Frames: *358' $W/m2.txt"
+check "merge with repeated time codes repairs everything" "grep -q 'Frames with issues: *0' $W/m2.txt || grep -q 'video errors: *0 frames' $W/m2.txt"
+
+# audio repair: error codes on every other track (one head cannot read the
+# audio) must be interpolated, not played as silence
+python3 - "$W/clean.dv" "$W/audbad.dv" <<'PY'
+import sys
+d = bytearray(open(sys.argv[1], 'rb').read())
+for fr in range(0, len(d), 120000):
+    for dseq in range(1, 10, 2):
+        for blk in range(150):
+            o = fr + dseq * 12000 + blk * 80
+            if d[o] & 0xE0 == 0x60:
+                d[o + 8:o + 80] = b"\x80\x00" * 36
+open(sys.argv[2], 'wb').write(d)
+PY
+"$OLDDV" "$W/clean.dv" --wav "$W/ref.wav" 2>/dev/null
+"$OLDDV" "$W/audbad.dv" --wav "$W/fixed.wav" 2>/dev/null
+"$OLDDV" "$W/audbad.dv" --wav "$W/silent.wav" --no-audio-repair 2>/dev/null
+ratio=$(python3 - "$W/ref.wav" "$W/fixed.wav" "$W/silent.wav" <<'PY'
+import sys, array
+def rd(p):
+    a = array.array('h'); a.frombytes(open(p, 'rb').read()[44:]); return a
+r, f, s = rd(sys.argv[1]), rd(sys.argv[2]), rd(sys.argv[3])
+ef = sum((x - y) ** 2 for x, y in zip(r, f)); es = sum((x - y) ** 2 for x, y in zip(r, s))
+print(int(100 * ef / es) if es and len(r) == len(f) == len(s) else 999)
+PY
+)
+check "audio repair: error is ${ratio}% of the error left by silence (must be under 5%)" "[ $ratio -lt 5 ]"
+a3=$(ffmpeg -v error -i "$W/audbad.dv" -map 0:a:0 -f s16le - | md5sum)
+a4=$(tail -c +45 "$W/silent.wav" | md5sum)
+check "without repair the audio is ffmpeg's decode" "[ \"$a3\" = \"$a4\" ]"
+
 [ $fail = 0 ] && echo "All tests passed." || { echo "Some tests failed."; exit 1; }

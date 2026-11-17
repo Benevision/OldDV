@@ -56,6 +56,7 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t size, int64_t pos)
         badKeys = [[NSMutableIndexSet alloc] init];
         takes = [[NSMutableArray alloc] init];
         deckQueue = dispatch_queue_create("org.olddv.deck", NULL);
+        logQueue = dispatch_queue_create("org.olddv.log", NULL);
         noDataTimeout = 5;
     }
     return self;
@@ -69,12 +70,48 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t size, int64_t pos)
     [badKeys release];
     [takes release];
     dispatch_release(deckQueue);
+    dispatch_release(logQueue);
+    [logPath release];
     pthread_mutex_destroy(&mtx);
     [super dealloc];
 }
 
+/* Every log line also goes to ~/Library/Logs/OldDV Rescue.log and, during
+ * a capture, to <capture name>.log next to the capture file, so that a
+ * session can be looked at afterwards. Written on a queue of its own: a
+ * stalled network share must not block the caller. */
+static void append_line(NSString *path, NSString *text)
+{
+    FILE *f = fopen([path fileSystemRepresentation], "a");
+    if (f) {
+        fputs([text UTF8String], f);
+        fclose(f);
+    }
+}
+
+- (void)setLogPath:(NSString *)path
+{
+    NSString *p = [path copy];
+    dispatch_async(logQueue, ^{
+        [logPath release];
+        logPath = p;
+    });
+}
+
 - (void)log:(NSString *)line
 {
+    time_t t = time(NULL);
+    struct tm tmv;
+    char stamp[32];
+    NSString *text;
+    localtime_r(&t, &tmv);
+    strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tmv);
+    text = [NSString stringWithFormat:@"%s  %@\n", stamp, line];
+    dispatch_async(logQueue, ^{
+        append_line([NSHomeDirectory() stringByAppendingPathComponent:@"Library/Logs/OldDV Rescue.log"], text);
+        if (logPath)
+            append_line(logPath, text);
+    });
     [(NSObject *)delegate performSelectorOnMainThread:@selector(engineLogLine:) withObject:line waitUntilDone:NO];
 }
 
@@ -204,6 +241,21 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t size, int64_t pos)
             }
         }
     }
+    /* A deck that has stopped (end of the tape) or plays blank tape keeps
+     * sending frames: every video block flagged as concealed, or the same
+     * tape position again and again. Such frames are "dead". */
+    {
+        int dead = f.full_conceal_vid
+            || (haveLast && f.tc_valid && last.tc_valid && f.abst_valid && last.abst_valid
+                && f.abst == last.abst && tc_key(&f) == tc_key(&last));
+        if (!dead) {
+            lastSignalTime = now_s();
+            deadFrames = 0;
+            if (state == OVEngineRecording && fp)
+                signalSeen = 1;
+        } else if (state == OVEngineRecording && fp)
+            deadFrames++;
+    }
     last = f;
     haveLast = 1;
     if (f.tc_valid)
@@ -229,7 +281,9 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t size, int64_t pos)
     s.fileBytes = fileBytes;
     s.bufferedBytes = fp ? (int64_t)dv_writer_pending(fp) : 0;
     s.droppedBytes = droppedBytes;
+    s.deadFrames = deadFrames;
     s.secondsSinceData = lastDataTime ? now_s() - lastDataTime : -1;
+    s.secondsSinceSignal = (signalSeen && lastSignalTime) ? now_s() - lastSignalTime : -1;
     pthread_mutex_unlock(&mtx);
     return s;
 }
@@ -276,6 +330,8 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t size, int64_t pos)
     fileBytes = 0;
     writeError = 0;
     droppedBytes = 0;
+    signalSeen = 0;
+    deadFrames = 0;
     report = (dv_report *)calloc(1, sizeof(dv_report));
     dv_report_init(report, [path fileSystemRepresentation]);
     /* restart frame splitting so that frame positions are file offsets */
@@ -364,7 +420,12 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t size, int64_t pos)
     state = OVEngineRecording;
     pthread_mutex_unlock(&mtx);
     [self notifyState];
-    [self log:[NSString stringWithFormat:@"Recording to %@", path]];
+    [self setLogPath:[basePath stringByAppendingPathExtension:@"log"]];
+    [self log:[NSString stringWithFormat:@"OldDV Rescue %s on %@, capture engine: %@, deck control: %@",
+               OLDDV_VERSION, [[NSProcessInfo processInfo] operatingSystemVersionString], [self engineName],
+               deck ? [deck name] : @"none"]];
+    [self log:[NSString stringWithFormat:@"Recording to %@ (finish after %.0f s without signal, %d retry pass(es), %@)",
+               path, noDataTimeout, retryCount, play ? @"deck started by the app" : @"deck not started by the app"]];
     if (play && deck) {
         OVDeck *d = deck;
         dispatch_async(deckQueue, ^{ [d play]; });
@@ -375,11 +436,27 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t size, int64_t pos)
 - (void)finishPass1
 {
     dv_report *r = [self closeFile];
+    uint32_t recorded = 0;
+    NSUInteger bad;
     if (r) {
+        recorded = r->count;
+        [self log:[NSString stringWithFormat:@"First pass: %u frames, %u with issues, %u time code break(s), %u recording start(s)",
+                   r->count, r->frames_with_errors, r->tc_breaks, r->rec_starts]];
         dv_report_free(r);
         free(r);
+        r = NULL;
     }
-    if (!cancel && retryCount > 0 && [badKeys count]) {
+    pthread_mutex_lock(&mtx);
+    bad = [badKeys count];
+    pthread_mutex_unlock(&mtx);
+    if (!cancel && retryCount > 0 && bad && recorded && bad > (NSUInteger)recorded * 3 / 10) {
+        /* errors all over the tape (dirty heads, tape recorded on another
+         * camcorder, LP mode...): winding to hundreds of sections wears the
+         * tape and brings nothing a second complete capture does not */
+        [self log:[NSString stringWithFormat:@"%lu of %u frames have errors: too many to re-read section by section. "
+                   @"Clean the heads or try another camcorder, capture the whole tape again under another name, "
+                   @"then use Merge Takes.", (unsigned long)bad, recorded]];
+    } else if (!cancel && retryCount > 0 && bad) {
         if (!deck) {
             [self log:@"Retry of bad sections skipped: the device has no AV/C deck control."];
         } else {
@@ -395,6 +472,7 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t size, int64_t pos)
         OVDeck *d = deck;
         dispatch_async(deckQueue, ^{ [d stop]; });
     }
+    [self log:@"Capture finished."];
     [self setState:backend ? OVEngineMonitoring : OVEngineIdle];
 }
 
@@ -416,7 +494,12 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t size, int64_t pos)
     if (deck && t - lastDeckPoll > 1.0) {
         OVDeck *d = deck;
         lastDeckPoll = t;
-        dispatch_async(deckQueue, ^{ deckStateCache = (int)[d state]; });
+        dispatch_async(deckQueue, ^{
+            int st = (int)[d state];
+            if (st != deckStateCache && state != OVEngineIdle && state != OVEngineMonitoring)
+                [self log:[NSString stringWithFormat:@"Deck: %@", [OVDeck describeState:(OVDeckState)st]]];
+            deckStateCache = st;
+        });
     }
     if (state == OVEngineRecording) {
         OVLiveStats s = [self stats];
@@ -425,8 +508,20 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t size, int64_t pos)
             cancel = YES;
             [self finishPass1];
         } else if (noDataTimeout > 0 && s.framesRecorded > 0 && s.secondsSinceData > noDataTimeout) {
-            [self log:[NSString stringWithFormat:@"No signal for %.0f seconds (end of tape?): capture finished.", noDataTimeout]];
+            [self log:[NSString stringWithFormat:@"No data from the device for %.0f seconds (end of tape?): finishing.", noDataTimeout]];
             [self finishPass1];
+        } else if (noDataTimeout > 0 && s.secondsSinceSignal > noDataTimeout) {
+            /* Frames still arrive but carry no picture. If the deck says it
+             * has stopped, this is the end. If it still plays, it may be a
+             * blank section between two recordings: wait much longer. */
+            BOOL stopped = deck && (deckStateCache == OVDeckStopped || deckStateCache == OVDeckNoTape);
+            double limit = noDataTimeout * 6 > 90 ? noDataTimeout * 6 : 90;
+            if (stopped || s.secondsSinceSignal > limit) {
+                [self log:[NSString stringWithFormat:@"No picture for %.0f seconds (%@): finishing. "
+                           @"The last %u frames of the file are blank or repeated.", s.secondsSinceSignal,
+                           stopped ? @"the deck has stopped, end of the tape" : @"blank tape", s.deadFrames]];
+                [self finishPass1];
+            }
         }
     }
 }

@@ -1155,6 +1155,15 @@ static void log_to_main(void *ctx, const char *line)
     NSPipe *errPipe = [NSPipe pipe];
     NSString *errText;
     BOOL mp4 = [[[out pathExtension] lowercaseString] isEqualToString:@"mp4"];
+    /* The audio is extracted by our own code into a temporary .wav: it
+     * repairs the audio error codes of the tape, which ffmpeg would play as
+     * silence (a loud buzz), and it keeps the sound in sync when the audio
+     * description of a frame is unreadable. */
+    NSString *wav = [out stringByAppendingString:@".audio.tmp.wav"];
+    BOOL haveWav = dv_write_wav([dv fileSystemRepresentation], 0, 0, [wav fileSystemRepresentation], 0,
+                                log_to_main, NULL, self) == 0;
+    if (!haveWav)
+        [[NSFileManager defaultManager] removeItemAtPath:wav error:NULL];
     if ([[o objectForKey:@"deint"] boolValue])
         [vf addObject:@"yadif=0:-1:0"];
     if ([[o objectForKey:@"square"] boolValue])
@@ -1162,8 +1171,12 @@ static void log_to_main(void *ctx, const char *line)
     [vf addObject:@"setsar=1"];
     if (![[o objectForKey:@"square"] boolValue])
         [vf removeLastObject];
-    [args addObjectsFromArray:[NSArray arrayWithObjects:@"-y", @"-nostdin", @"-v", @"error", @"-i", dv,
-                               @"-map", @"0:v:0", @"-map", @"0:a:0?", nil]];
+    if (haveWav)
+        [args addObjectsFromArray:[NSArray arrayWithObjects:@"-y", @"-nostdin", @"-v", @"error", @"-i", dv, @"-i", wav,
+                                   @"-map", @"0:v:0", @"-map", @"1:a:0", nil]];
+    else
+        [args addObjectsFromArray:[NSArray arrayWithObjects:@"-y", @"-nostdin", @"-v", @"error", @"-i", dv,
+                                   @"-map", @"0:v:0", @"-map", @"0:a:0?", nil]];
     if ([vf count])
         [args addObjectsFromArray:[NSArray arrayWithObjects:@"-vf", [vf componentsJoinedByString:@","], nil]];
     [args addObjectsFromArray:[NSArray arrayWithObjects:
@@ -1180,11 +1193,13 @@ static void log_to_main(void *ctx, const char *line)
         [t launch];
     } @catch (NSException *e) {
         log_to_main(self, "  ffmpeg could not be started (check the encoder path).");
+        [[NSFileManager defaultManager] removeItemAtPath:wav error:NULL];
         return NO;
     }
     errText = [[[NSString alloc] initWithData:[[errPipe fileHandleForReading] readDataToEndOfFile]
                                      encoding:NSUTF8StringEncoding] autorelease];
     [t waitUntilExit];
+    [[NSFileManager defaultManager] removeItemAtPath:wav error:NULL];
     if ([t terminationStatus]) {
         log_to_main(self, [[NSString stringWithFormat:@"  %@ FAILED: %@", [out lastPathComponent],
                             errText ? [errText stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] : @""] UTF8String]);

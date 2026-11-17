@@ -27,7 +27,7 @@ and DVRescue's Qt player/GUI.
 
 ### Option A: prebuilt app
 
-1. Copy `dist/OldDV-Rescue-1.0.0-mac.zip` to the Mac and double-click it.
+1. Copy `dist/OldDV-Rescue-1.0.1-mac.zip` to the Mac and double-click it.
 2. Drag **OldDV Rescue.app** to *Applications*.
 3. On 10.6 it just opens. On 10.8+ Gatekeeper may say the app is from an unidentified
    developer: right-click (Ctrl-click) the app, choose **Open**, then confirm once.
@@ -75,18 +75,26 @@ on 10.6 as well.
 3. Options:
    * *play the tape when capture starts*: sends PLAY at start and STOP at the end.
    * *Finish when there is no signal for N seconds*: stops by itself at the end of the
-     recorded part of the tape.
+     recorded part of the tape. A camcorder that has stopped keeps sending frames (a
+     frozen or blank picture), so the app looks at the frames, not only at the data
+     flow: it finishes when there has been no moving, readable picture for N seconds and
+     the deck reports that it has stopped. While the deck still plays (a blank section
+     between two recordings), it waits 6 × N seconds, at least 90.
    * *Re-read sections with errors: N times*: after the first pass, the deck rewinds to each
      section that had errors (located by time code), plays it again and records it into
      `name.retry1.dv`, `name.retry2.dv`, and so on. All takes are then merged into
      `name.merged.dv`, keeping the best blocks of every take. This is DVRescue's
      "rewind count", run as a pass after the capture. It needs deck control and a tape with
-     time code, which consumer DV always has.
+     time code, which consumer DV always has. If more than 30 % of the frames have errors,
+     the retry is skipped: capture the whole tape a second time and use *Merge Takes*.
+     **The section retry has not been validated on real hardware yet; leave it at 0 for
+     tapes that matter.**
 4. **Start Capture**. The graph shows errors as they happen. Red bars mean concealed video
    blocks, orange bars mean audio errors, blue marks show a new recording on the tape, and
    yellow marks show a time code break.
 
-Each `.dv` file gets a `.dv.dvrescue.xml` report next to it.
+Each `.dv` file gets a `.dv.dvrescue.xml` report next to it, and the Capture log is saved
+as `name.log` in the same folder (and always in `~/Library/Logs/OldDV Rescue.log`).
 The raw `.dv` is your preservation master. Keep it even if you make a merged or packaged
 version.
 
@@ -110,10 +118,14 @@ frames with issues.
 ### Merge Takes
 
 Add two or more captures of the same tape, choose an output file and click **Merge**.
-Frames are lined up by absolute track number when the tape has it, otherwise by time code.
-One-off glitches in time code or track number are ignored, so they don't break the
-alignment. For each frame, the take with the fewest bad blocks is used, and each of its
-bad blocks is replaced by a good copy of the same block from another take.
+The **first** capture is the timeline: the merged file has its frames, in its order. The
+frames of the other captures are attached to it by following the sequence, and located
+by absolute track number and time code after a jump. Neither is unique on a real tape
+(time code restarts after a blank section, and some camcorders restart the track number
+at every recording), so they are never used to sort frames. One-off glitches are ignored.
+Frames found only in a later capture are inserted where they belong. For each frame, the
+take with the fewest bad blocks is used, and each of its bad blocks is replaced by a good
+copy of the same block from another take.
 
 ### Package & Export
 
@@ -148,6 +160,18 @@ compile on a Core 2 Duo, but it is the official way to get it:
 ```bash
 sudo port install ffmpeg +gpl2
 ```
+
+**Audio repair.** When a deck cannot read an audio block it sends an error code instead
+of the samples. This is common with tapes recorded on another camcorder or in LP mode,
+and with a dirty head: the picture is fine but a third of the audio samples are missing,
+on every other track. Players (and ffmpeg) play the holes as silence, which sounds like
+a loud buzz over the whole recording. DV spreads the samples of a frame over its tracks
+precisely so that such holes are short, so the exports fill them by interpolation between
+the good neighbours (holes longer than 1 ms are muted with a fade). This applies to the
+`.mov` (DV) audio track and to the H.264 exports; the `.dv` file and the DV video are
+never changed. The log says how much was repaired. On the command line:
+`olddv tape.dv --wav audio.wav` writes the repaired audio alone, and
+`--no-audio-repair` gives the old behaviour.
 
 The lossless `.mov` was checked with ffmpeg: the DV frames inside are bit-identical to the
 `.dv`, and the audio matches ffmpeg's own DV audio decoding sample for sample. That
@@ -229,7 +253,8 @@ olddv tape.dv --mov tape.mov
 * `-x`: write the XML report (DVRescue format).
 * `-m`: merge takes, picking the best blocks of each.
 * `--split`: write one file per recording.
-* `--mov`: lossless QuickTime rewrap.
+* `--mov`: lossless QuickTime rewrap (audio error codes repaired).
+* `--wav`: the repaired audio as a `.wav` file.
 
 `olddv --help` lists all options, including `--csv`.
 
@@ -262,8 +287,12 @@ point to the classic `LC_UNIXTHREAD` form that 10.6 understands. The AVFoundatio
 is compiled against a newer SDK but loaded with `dlopen` only on 10.7+, so nothing in the
 binary requires it on 10.6.
 
-**Important:** the prebuilt app has not been run on a real Mac or with a real camcorder.
-It was built and checked on Linux. If it does not start, or capture shows no frames,
+The same script runs on a modern Mac with Homebrew `llvm` and `lld` in the `PATH` and the
+10.6 / 10.11 SDKs unpacked somewhere (`SDK106=... SDK_AVF=... tools/cross-build.sh`).
+
+**Important:** the raw capture path has been confirmed on a late-2009 Mac mini with a PAL
+camcorder (a clean DIF stream of whole frames over a one hour capture). Deck control,
+the end-of-tape detection and the section retry have not been validated on hardware yet. If it does not start, or capture shows no frames,
 build it yourself with `./build.sh` (Option B). If you still have problems, the
 messages in the Capture log, or in Console.app, say what went wrong.
 

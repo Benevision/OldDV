@@ -23,7 +23,7 @@
 extern "C" {
 #endif
 
-#define OLDDV_VERSION "1.0.0"
+#define OLDDV_VERSION "1.0.1"
 
 #define DV_BLOCK_SIZE   80
 #define DV_DSEQ_SIZE    12000          /* 150 blocks of 80 bytes */
@@ -265,10 +265,36 @@ typedef struct dv_audio_fmt {
 
 int  dv_audio_info(const uint8_t *frame, size_t size, dv_audio_fmt *fmt);
 void dv_audio_extract(const uint8_t *frame, size_t size, const dv_audio_fmt *fmt, int pair, int16_t *out);
+/* same, and valid[] (samples * 2 bytes) tells which samples were read from
+ * the tape (1) and which are missing or audio error codes (0) */
+void dv_audio_extract_ex(const uint8_t *frame, size_t size, const dv_audio_fmt *fmt, int pair, int16_t *out, uint8_t *valid);
+
+/* Concealment of audio error codes: short holes are interpolated, long
+ * ones are muted. One state per stereo pair, fed frame after frame. */
+typedef struct dv_audio_conceal {
+    int16_t  last[2];
+    int      have[2];
+    uint64_t total, interpolated, muted;   /* sample counts (both channels) */
+} dv_audio_conceal;
+
+void dv_audio_conceal_init(dv_audio_conceal *st);
+void dv_audio_conceal_frame(dv_audio_conceal *st, int16_t *pcm, const uint8_t *valid, int samples);
+
+enum {
+    DV_EXPORT_NO_CONCEAL = 1   /* keep audio error codes as silence (what ffmpeg does) */
+};
 
 /* Rewrap bytes [start, end) of a DV file (end <= 0: to the end) into a
- * QuickTime movie: DV video track + 16-bit PCM audio track(s). */
+ * QuickTime movie: DV video track + 16-bit PCM audio track(s). The video
+ * is copied untouched; audio error codes are concealed. */
 int dv_write_mov(const char *in, int64_t start, int64_t end, const char *out,
+                 dv_log_cb log, dv_progress_cb progress, void *ctx);
+int dv_write_mov_ex(const char *in, int64_t start, int64_t end, const char *out, int flags,
+                    dv_log_cb log, dv_progress_cb progress, void *ctx);
+/* Audio of the first stereo pair as a 16-bit .wav, one frame's worth of
+ * samples per DV frame (so it stays in sync with the video of the same
+ * range). Returns 0, 1 if the file has no audio, -1 on error. */
+int dv_write_wav(const char *in, int64_t start, int64_t end, const char *out, int flags,
                  dv_log_cb log, dv_progress_cb progress, void *ctx);
 
 #ifdef __cplusplus

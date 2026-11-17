@@ -26,6 +26,9 @@ static void usage(void)
         "      --split BASE        split the input into BASE_partNNN.dv\n"
         "      --mov FILE          rewrap the input into a QuickTime .mov\n"
         "                          (DV video untouched + PCM audio, lossless)\n"
+        "                          audio error codes are repaired by interpolation\n"
+        "      --wav FILE          write the (repaired) audio as a .wav file\n"
+        "      --no-audio-repair   keep unreadable audio samples as silence\n"
         "      --by LIST           split criteria: rec,format,tc (default rec,format)\n"
         "      --min N             minimum part length in frames (default 1)\n"
         "  -p, --progress          show progress on stderr\n"
@@ -58,6 +61,7 @@ int main(int argc, char **argv)
 {
     const char *inputs[64];
     int ninputs = 0, i, ret = 0;
+    const char *wav_out = NULL; int export_flags = 0;
     const char *mov_out = NULL, *xml_out = NULL, *merge_out = NULL, *merge_log = NULL, *split_base = NULL;
     int summary = 0, csv = 0, split_flags = DV_SPLIT_REC_START | DV_SPLIT_FORMAT;
     unsigned min_frames = 1;
@@ -71,6 +75,8 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--merge-log") && i + 1 < argc) merge_log = argv[++i];
         else if (!strcmp(a, "--split") && i + 1 < argc) split_base = argv[++i];
         else if (!strcmp(a, "--mov") && i + 1 < argc) mov_out = argv[++i];
+        else if (!strcmp(a, "--wav") && i + 1 < argc) wav_out = argv[++i];
+        else if (!strcmp(a, "--no-audio-repair")) export_flags |= DV_EXPORT_NO_CONCEAL;
         else if (!strcmp(a, "--by") && i + 1 < argc) {
             const char *v = argv[++i];
             split_flags = 0;
@@ -113,8 +119,18 @@ int main(int argc, char **argv)
     }
 
     if (mov_out) {
-        if (dv_write_mov(inputs[0], 0, 0, mov_out, log_cb, quiet ? NULL : progress_cb, NULL)) {
+        if (dv_write_mov_ex(inputs[0], 0, 0, mov_out, export_flags, log_cb, quiet ? NULL : progress_cb, NULL)) {
             fprintf(stderr, "Rewrap failed\n");
+            return 1;
+        }
+        if (!wav_out)
+            return 0;
+    }
+
+    if (wav_out) {
+        int r = dv_write_wav(inputs[0], 0, 0, wav_out, export_flags, log_cb, quiet ? NULL : progress_cb, NULL);
+        if (r) {
+            fprintf(stderr, r > 0 ? "No audio in this file\n" : "Audio export failed\n");
             return 1;
         }
         return 0;

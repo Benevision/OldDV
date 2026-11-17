@@ -55,6 +55,19 @@ int dv_audio_info(const uint8_t *f, size_t size, dv_audio_fmt *fmt)
             fmt->quant = qu;
             fmt->samples = min_samples[fmt->dsf][smp] + (b[4] & 0x3F);
             fmt->pairs = qu == 1 ? 2 : 1;
+            if (fmt->pairs == 2) {
+                /* 12 bit: the second half of the frame carries channels 3/4.
+                 * Audio mode 1111 there means "nothing recorded". */
+                size_t half = nb / 2, bj;
+                for (bj = half; bj < nb; bj++) {
+                    const uint8_t *c = f + bj * DV_BLOCK_SIZE;
+                    if ((c[0] & 0xE0) == 0x60 && c[3] == 0x50) {
+                        if ((c[4 + 1] & 0x0F) == 0x0F)
+                            fmt->pairs = 1;
+                        break;
+                    }
+                }
+            }
             return 0;
         }
     }
@@ -62,12 +75,16 @@ int dv_audio_info(const uint8_t *f, size_t size, dv_audio_fmt *fmt)
 }
 
 /* Extract samples of stereo pair 'pair' (0 or 1) as interleaved native
- * int16 L/R into out (fmt->samples * 2 values). Missing data = silence. */
-void dv_audio_extract(const uint8_t *f, size_t size, const dv_audio_fmt *fmt, int pair, int16_t *out)
+ * int16 L/R into out (fmt->samples * 2 values). Missing data = silence.
+ * valid (optional, fmt->samples * 2 bytes) is set to 1 for samples read
+ * from the tape and 0 for missing ones / error codes. */
+void dv_audio_extract_ex(const uint8_t *f, size_t size, const dv_audio_fmt *fmt, int pair, int16_t *out, uint8_t *valid)
 {
     int dseqs = fmt->dsf ? 12 : 10, half = dseqs / 2, n;
     int per = fmt->dsf ? 54 : 45, third = per / 3;
     memset(out, 0, (size_t)fmt->samples * 2 * sizeof(int16_t));
+    if (valid)
+        memset(valid, 0, (size_t)fmt->samples * 2);
     for (n = 0; n < fmt->samples; n++) {
         int ds = (n / 3 + 2 * (n % 3)) % half;
         int blk = 3 * (n % 3) + (n % per) / third;
@@ -83,6 +100,8 @@ void dv_audio_extract(const uint8_t *f, size_t size, const dv_audio_fmt *fmt, in
                 v = (f[off] << 8) | f[off + 1];
                 if (v == 0x8000)
                     v = 0; /* error code: silence */
+                else if (valid)
+                    valid[n * 2 + c] = 1;
                 out[n * 2 + c] = (int16_t)v;
             }
         } else {
@@ -94,8 +113,73 @@ void dv_audio_extract(const uint8_t *f, size_t size, const dv_audio_fmt *fmt, in
             r = ((unsigned)f[off + 1] << 4) | (f[off + 2] & 0x0F);
             out[n * 2] = l == 0x800 ? 0 : dv_12to16(l);
             out[n * 2 + 1] = r == 0x800 ? 0 : dv_12to16(r);
+            if (valid) {
+                valid[n * 2] = l != 0x800;
+                valid[n * 2 + 1] = r != 0x800;
+            }
         }
     }
+}
+
+void dv_audio_extract(const uint8_t *f, size_t size, const dv_audio_fmt *fmt, int pair, int16_t *out)
+{
+    dv_audio_extract_ex(f, size, fmt, pair, out, NULL);
+}
+
+/* Error concealment. A deck that cannot read an audio block sends the
+ * error code instead of the samples. Because DV shuffles the samples over
+ * the tracks of a frame, a lost block or track leaves short holes (1 to a
+ * few samples) spread over the frame, which sound like a loud buzz when
+ * they are played as silence. Short holes are filled by interpolation
+ * between the good neighbours (what a deck does on its analogue outputs);
+ * long ones are muted with a short fade. */
+#define DV_CONCEAL_MAX_GAP 32
+#define DV_CONCEAL_FADE    16
+
+void dv_audio_conceal_init(dv_audio_conceal *st)
+{
+    memset(st, 0, sizeof(*st));
+}
+
+void dv_audio_conceal_frame(dv_audio_conceal *st, int16_t *pcm, const uint8_t *valid, int samples)
+{
+    int c;
+    for (c = 0; c < 2; c++) {
+        int i = 0;
+        while (i < samples) {
+            int j, len, k;
+            int32_t left, right;
+            if (valid[i * 2 + c]) { i++; continue; }
+            for (j = i; j < samples && !valid[j * 2 + c]; j++)
+                ;
+            len = j - i;
+            left = i > 0 ? pcm[(i - 1) * 2 + c] : st->last[c];
+            right = j < samples ? pcm[j * 2 + c] : left;
+            if (i == 0 && !st->have[c])
+                left = right;
+            if (len <= DV_CONCEAL_MAX_GAP && !(i == 0 && j == samples)) {
+                for (k = 0; k < len; k++)
+                    pcm[(i + k) * 2 + c] = (int16_t)(left + (right - left) * (k + 1) / (len + 1));
+                st->interpolated += (uint64_t)len;
+            } else {
+                for (k = 0; k < len; k++) {
+                    int32_t v = 0;
+                    if (k < DV_CONCEAL_FADE)
+                        v = left * (DV_CONCEAL_FADE - k - 1) / DV_CONCEAL_FADE;
+                    else if (j < samples && len - k <= DV_CONCEAL_FADE)
+                        v = right * (DV_CONCEAL_FADE - (len - k)) / DV_CONCEAL_FADE;
+                    pcm[(i + k) * 2 + c] = (int16_t)v;
+                }
+                st->muted += (uint64_t)len;
+            }
+            i = j;
+        }
+        if (samples > 0) {
+            st->last[c] = pcm[(samples - 1) * 2 + c];
+            st->have[c] = 1;
+        }
+    }
+    st->total += (uint64_t)samples * 2;
 }
 
 /* ------------------------------------------------------------------ */
@@ -230,10 +314,21 @@ static void write_audio_trak(buf *m, int id, uint32_t rate, uint64_t total, cons
     (void)mvts;
 }
 
-int dv_write_mov(const char *in, int64_t start, int64_t end, const char *out,
-                 dv_log_cb log, dv_progress_cb progress, void *ctx)
+static void write_u32le(FILE *f, uint32_t v)
+{
+    uint8_t b[4];
+    b[0] = (uint8_t)v; b[1] = (uint8_t)(v >> 8); b[2] = (uint8_t)(v >> 16); b[3] = (uint8_t)(v >> 24);
+    fwrite(b, 1, 4, f);
+}
+
+/* wav = 0: QuickTime movie; wav = 1: audio of the first pair as .wav */
+static int export_file(const char *in, int64_t start, int64_t end, const char *out, int flags, int wav,
+                       dv_log_cb log, dv_progress_cb progress, void *ctx)
 {
     FILE *fi = fopen(in, "rb"), *fo = NULL;
+    uint8_t *valid = NULL;
+    dv_audio_conceal conceal[2];
+    int have_fmt = 0;
     scan_ctx sc;
     dv_splitter sp;
     uint8_t *data = NULL, *frame = NULL;
@@ -286,9 +381,12 @@ int dv_write_mov(const char *in, int64_t start, int64_t end, const char *out,
     /* 2. format from the first frame */
     frame = (uint8_t *)malloc(DV_MAX_FRAME * 4);
     pcm = (int16_t *)malloc(4000 * 2 * sizeof(int16_t));
+    valid = (uint8_t *)malloc(4000 * 2);
     offs = (uint64_t *)calloc(n * 3, sizeof(uint64_t));
-    if (!frame || !pcm || !offs)
+    if (!frame || !pcm || !offs || !valid)
         goto done;
+    dv_audio_conceal_init(&conceal[0]);
+    dv_audio_conceal_init(&conceal[1]);
     fseeko(fi, sc.f[0].pos, SEEK_SET);
     if (fread(frame, 1, sc.f[0].size > DV_MAX_FRAME * 4 ? DV_MAX_FRAME * 4 : sc.f[0].size, fi) == 0)
         goto done;
@@ -297,7 +395,7 @@ int dv_write_mov(const char *in, int64_t start, int64_t end, const char *out,
     dv_frame_free(&info);
     /* look a few frames further for audio / aspect (first frame may be damaged) */
     memset(&af0, 0, sizeof(af0));
-    for (i = 0; i < n && i < 30; i++) {
+    for (i = 0; i < n && i < 250; i++) {
         fseeko(fi, sc.f[i].pos, SEEK_SET);
         if (fread(frame, 1, sc.f[i].size, fi) != sc.f[i].size)
             break;
@@ -310,12 +408,26 @@ int dv_write_mov(const char *in, int64_t start, int64_t end, const char *out,
     vts = info.dsf ? 25 : 30000;
     vdur = info.dsf ? 1 : 1001;
     ntracks = af0.rate ? af0.pairs : 0;
+    if (wav) {
+        if (!ntracks) {
+            ret = 1;
+            goto done;
+        }
+        ntracks = 1;
+    }
 
     fo = fopen(out, "wb");
     if (!fo) {
         if (log) { snprintf(line, sizeof(line), "Cannot write %s", out); log(ctx, line); }
         goto done;
     }
+    if (wav) {
+        fwrite("RIFF", 1, 4, fo); write_u32le(fo, 0); fwrite("WAVEfmt ", 1, 8, fo);
+        write_u32le(fo, 16); write_u32le(fo, 0x00020001); /* PCM, 2 channels */
+        write_u32le(fo, af0.rate); write_u32le(fo, af0.rate * 4);
+        write_u32le(fo, 0x00100004);                      /* block align 4, 16 bit */
+        fwrite("data", 1, 4, fo); write_u32le(fo, 0);
+    } else
     /* ftyp + wide + mdat (64-bit size, patched at the end) */
     {
         static const uint8_t ftyp[] = { 0, 0, 0, 20, 'f', 't', 'y', 'p', 'q', 't', ' ', ' ', 0, 0, 2, 0, 'q', 't', ' ', ' ' };
@@ -335,32 +447,48 @@ int dv_write_mov(const char *in, int64_t start, int64_t end, const char *out,
         if (got < vsize) /* damaged / short frame: pad (decoder conceals) */
             memset(frame + got, 0, vsize - got);
         offs[i * 3] = (uint64_t)ftello(fo);
-        if (fwrite(frame, 1, vsize, fo) != vsize)
+        if (!wav && fwrite(frame, 1, vsize, fo) != vsize)
             goto done;
         if (ntracks) {
             uint16_t ns;
-            if (dv_audio_info(frame, got, &af) == 0 && af.rate == af0.rate && af.quant == af0.quant)
-                ns = (uint16_t)af.samples;
-            else {
-                af = af0;
+            dv_audio_fmt cur;
+            if (dv_audio_info(frame, got, &cur) == 0) {
+                if (cur.rate == af0.rate && cur.quant == af0.quant) {
+                    ns = (uint16_t)cur.samples;
+                    have_fmt = 1;
+                } else {
+                    /* another audio format than the file's tracks: silence */
+                    ns = (uint16_t)(i ? sc.f[i - 1].samples : af0.samples);
+                    have_fmt = 0;
+                    got = 0;
+                }
+            } else {
+                /* The audio source pack of this frame is unreadable. The
+                 * samples may still be there: read them with the format of
+                 * the frames before (error codes are concealed below). */
                 ns = (uint16_t)(i ? sc.f[i - 1].samples : af0.samples);
-                af.samples = ns;
-                memset(frame, 0, got); /* silence */
-                got = 0;
+                if (!have_fmt && i)
+                    got = 0;
             }
+            af = af0;
+            af.samples = ns;
             sc.f[i].samples = ns;
             total_samples += ns;
             for (k = 0; k < ntracks; k++) {
                 size_t j;
                 uint8_t *o = (uint8_t *)pcm;
                 if (got)
-                    dv_audio_extract(frame, got, &af, k, pcm);
-                else
+                    dv_audio_extract_ex(frame, got, &af, k, pcm, valid);
+                else {
                     memset(pcm, 0, (size_t)ns * 4);
-                for (j = 0; j < (size_t)ns * 2; j++) { /* big endian 'twos' */
+                    memset(valid, 0, (size_t)ns * 2);
+                }
+                if (!(flags & DV_EXPORT_NO_CONCEAL))
+                    dv_audio_conceal_frame(&conceal[k], pcm, valid, ns);
+                for (j = 0; j < (size_t)ns * 2; j++) { /* big endian 'twos', or little endian wav */
                     uint16_t v = (uint16_t)pcm[j];
-                    o[j * 2] = (uint8_t)(v >> 8);
-                    o[j * 2 + 1] = (uint8_t)v;
+                    o[j * 2 + (wav ? 1 : 0)] = (uint8_t)(v >> 8);
+                    o[j * 2 + (wav ? 0 : 1)] = (uint8_t)v;
                 }
                 offs[i * 3 + 1 + k] = (uint64_t)ftello(fo);
                 if (fwrite(pcm, 1, (size_t)ns * 4, fo) != (size_t)ns * 4)
@@ -369,6 +497,17 @@ int dv_write_mov(const char *in, int64_t start, int64_t end, const char *out,
         }
         if (progress && !(i % 50) && progress(ctx, (double)i / n))
             goto done;
+    }
+    if (wav) {
+        uint64_t bytes = total_samples * 4;
+        if (bytes > 0xFFFFFFD0u)
+            bytes = 0xFFFFFFD0u;
+        fseeko(fo, 4, SEEK_SET);
+        write_u32le(fo, (uint32_t)bytes + 36);
+        fseeko(fo, 40, SEEK_SET);
+        write_u32le(fo, (uint32_t)bytes);
+        fseeko(fo, 0, SEEK_END);
+        goto finish;
     }
     mdat_end = (uint64_t)ftello(fo);
     /* patch mdat 64-bit size */
@@ -459,6 +598,7 @@ int dv_write_mov(const char *in, int64_t start, int64_t end, const char *out,
         if (fwrite(m.d, 1, m.n, fo) != m.n)
             goto done;
     }
+finish:
     if (fclose(fo)) {
         fo = NULL;
         goto done;
@@ -467,12 +607,23 @@ int dv_write_mov(const char *in, int64_t start, int64_t end, const char *out,
     if (progress)
         progress(ctx, 1.0);
     if (log) {
+        uint64_t tot = conceal[0].total + conceal[1].total;
+        uint64_t itp = conceal[0].interpolated + conceal[1].interpolated;
+        uint64_t mut = conceal[0].muted + conceal[1].muted;
         snprintf(line, sizeof(line), "%s: %lu frames, %s%s", out, (unsigned long)n,
                  ntracks ? "PCM audio" : "no audio", ntracks == 2 ? " (2 stereo tracks)" : "");
         log(ctx, line);
+        if (tot && (itp || mut)) {
+            snprintf(line, sizeof(line), "  audio repair: %.1f%% of the samples were unreadable on the tape; "
+                     "%.1f%% rebuilt by interpolation, %.1f%% muted",
+                     100.0 * (double)(itp + mut) / (double)tot, 100.0 * (double)itp / (double)tot,
+                     100.0 * (double)mut / (double)tot);
+            log(ctx, line);
+        }
     }
     ret = 0;
 done:
+    free(valid);
     if (fo)
         fclose(fo);
     fclose(fi);
@@ -483,4 +634,22 @@ done:
     free(offs);
     free(m.d);
     return ret;
+}
+
+int dv_write_mov_ex(const char *in, int64_t start, int64_t end, const char *out, int flags,
+                    dv_log_cb log, dv_progress_cb progress, void *ctx)
+{
+    return export_file(in, start, end, out, flags, 0, log, progress, ctx);
+}
+
+int dv_write_mov(const char *in, int64_t start, int64_t end, const char *out,
+                 dv_log_cb log, dv_progress_cb progress, void *ctx)
+{
+    return export_file(in, start, end, out, 0, 0, log, progress, ctx);
+}
+
+int dv_write_wav(const char *in, int64_t start, int64_t end, const char *out, int flags,
+                 dv_log_cb log, dv_progress_cb progress, void *ctx)
+{
+    return export_file(in, start, end, out, flags, 1, log, progress, ctx);
 }

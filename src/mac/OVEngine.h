@@ -43,6 +43,8 @@ typedef struct OVLiveStats {
     int64_t  bufferedBytes;  /* waiting to be written (slow disk / share) */
     uint64_t droppedBytes;   /* lost because the destination was too slow */
     double   secondsSinceData;
+    uint32_t deadFrames;     /* blank / repeated frames at the end of the file */
+    double   secondsSinceSignal; /* since the last frame with a moving, readable picture; -1: none yet */
 } OVLiveStats;
 
 @interface OVEngine : NSObject <OVCaptureSink> {
@@ -60,6 +62,11 @@ typedef struct OVLiveStats {
     uint64_t framesSeen;
     double lastDataTime;
     double lastTCTime;
+    double lastSignalTime;  /* last frame that was not dead (see -frame:size:pos:) */
+    int signalSeen;         /* a live frame was recorded in this file */
+    uint32_t deadFrames;    /* dead frames at the end of the current file */
+    NSString *logPath;      /* capture log next to the capture file */
+    dispatch_queue_t logQueue;
 
     dv_writer *fp;          /* buffered writer (network shares can stall) */
     uint64_t droppedBytes;

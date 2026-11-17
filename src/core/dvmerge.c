@@ -1,29 +1,55 @@
 /*
  * OldDV Rescue - merge several captures of the same tape.
  *
- * Same idea as DVRescue's merge (--merge): frames of every input are lined
- * up (by absolute track number when available, else by time code), the
- * input with the fewest bad blocks is taken for each frame and its bad DIF
- * blocks are replaced by good blocks from the other inputs.
+ * Same idea as DVRescue's merge (--merge): the frames of every input are
+ * lined up, the input with the fewest bad blocks is taken for each frame
+ * and its bad DIF blocks are replaced by good blocks from the other inputs.
+ *
+ * The first input is the timeline: the output has its frames, in its
+ * order. The frames of the other inputs are attached to it by following
+ * the sequence, and by looking up (absolute track number, time code) after
+ * a jump. Neither value is unique on a real tape: time code restarts after
+ * a blank section, and some camcorders restart the absolute track number
+ * at every recording. So they are never used to sort the frames, only to
+ * find where a run of frames belongs. Frames that exist only in a later
+ * input (dropped in the first one) are inserted where they belong.
  */
 #include "dvcore.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
 
-typedef struct mentry {
-    int64_t key;
+/* one copy of a tape frame: frame 'frame' of input 'input' */
+typedef struct mcopy {
     int32_t input;
     uint32_t frame;
-} mentry;
+    int32_t next;      /* next copy of the same slot, -1 = end */
+} mcopy;
 
-static int mentry_cmp(const void *a, const void *b)
+/* one output frame */
+typedef struct mslot {
+    int64_t key;       /* (abst, tc) of the frame that created the slot */
+    int32_t abst;      /* -1 = unknown */
+    int32_t tc;        /* -1 = unknown */
+    int32_t first, last; /* copies */
+    int32_t after;     /* insertion: index of the slot it follows (-1: start) */
+    uint32_t seq;
+} mslot;
+
+typedef struct mkey { int64_t key; int32_t slot; } mkey;
+
+static int mkey_cmp(const void *a, const void *b)
 {
-    const mentry *x = (const mentry *)a, *y = (const mentry *)b;
+    const mkey *x = (const mkey *)a, *y = (const mkey *)b;
     if (x->key != y->key) return x->key < y->key ? -1 : 1;
-    if (x->input != y->input) return x->input < y->input ? -1 : 1;
-    if (x->frame != y->frame) return x->frame < y->frame ? -1 : 1;
-    return 0;
+    return x->slot < y->slot ? -1 : (x->slot > y->slot);
+}
+
+static int mslot_ins_cmp(const void *a, const void *b)
+{
+    const mslot *x = (const mslot *)a, *y = (const mslot *)b;
+    if (x->after != y->after) return x->after < y->after ? -1 : 1;
+    return x->seq < y->seq ? -1 : (x->seq > y->seq);
 }
 
 static int64_t tc_frames(const dv_frame *f)
@@ -43,8 +69,6 @@ static void logf_(dv_log_cb log, void *ctx, const char *fmt, ...)
     va_end(ap);
     log(ctx, line);
 }
-
-typedef struct seg { int64_t first, min, max; int mapped; } seg;
 
 /* Turn raw per-frame positions (time code in frames, or absolute track
  * number) into keys usable for lining up takes: isolated glitches (one
@@ -94,21 +118,227 @@ static void smooth_keys(int64_t *val, uint8_t *ok, uint32_t n, int64_t step)
     }
 }
 
+typedef struct mctx {
+    int use_abst, use_tc;
+    int32_t **pa, **pt;    /* per input, per frame: smoothed abst / tc, -1 = unknown */
+    mslot *T; size_t nT, capT;
+    mcopy *C; size_t nC;
+    mkey *K; size_t nK;
+} mctx;
+
+/* position of a frame: abst / tc (-1 when unknown or unused), and the
+ * combined key (-1 unless every used value is known) */
+static void frame_pos(const mctx *m, int k, uint32_t index, int32_t *abst, int32_t *tc, int64_t *key)
+{
+    if (!m->use_abst && !m->use_tc) { /* no position on the tape: frame number */
+        *abst = *tc = -1;
+        *key = (int64_t)index;
+        return;
+    }
+    *abst = m->use_abst ? m->pa[k][index] : -1;
+    *tc = m->use_tc ? m->pt[k][index] : -1;
+    if ((m->use_abst && *abst < 0) || (m->use_tc && *tc < 0))
+        *key = -1;
+    else
+        *key = ((int64_t)(m->use_abst ? *abst : 0) << 28) | (int64_t)(m->use_tc ? *tc : 0);
+}
+
+static int32_t add_copy(mctx *m, mslot *sl, int32_t input, uint32_t frame)
+{
+    int32_t c = (int32_t)m->nC++;
+    m->C[c].input = input;
+    m->C[c].frame = frame;
+    m->C[c].next = -1;
+    if (sl->first < 0)
+        sl->first = c;
+    else
+        m->C[sl->last].next = c;
+    sl->last = c;
+    return c;
+}
+
+static void rebuild_keys(mctx *m)
+{
+    size_t i;
+    m->nK = 0;
+    for (i = 0; i < m->nT; i++)
+        if (m->T[i].key >= 0) {
+            m->K[m->nK].key = m->T[i].key;
+            m->K[m->nK].slot = (int32_t)i;
+            m->nK++;
+        }
+    qsort(m->K, m->nK, sizeof(mkey), mkey_cmp);
+}
+
+/* slot with this key: the first one after 'cur', else the last one before */
+static int32_t find_slot(const mctx *m, int64_t key, int32_t cur)
+{
+    size_t lo = 0, hi = m->nK;
+    int32_t before = -1;
+    if (key < 0)
+        return -1;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (m->K[mid].key < key) lo = mid + 1; else hi = mid;
+    }
+    for (; lo < m->nK && m->K[lo].key == key; lo++) {
+        if (m->K[lo].slot > cur)
+            return m->K[lo].slot;
+        before = m->K[lo].slot;
+    }
+    return before;
+}
+
+/* do the frames after j continue from slot 'at' (frame j being at 'at')? */
+static int confirmed(const mctx *m, const dv_report *r, int k, uint32_t j, int32_t at, int need_two)
+{
+    uint32_t q;
+    int seen = 0, good = 0;
+    for (q = j + 1; q < r->count && q <= j + 8 && seen < 3; q++) {
+        int32_t a, t, d;
+        int64_t key;
+        frame_pos(m, k, q, &a, &t, &key);
+        if (key < 0)
+            continue;
+        seen++;
+        /* a jump may land a frame or two off; a damaged position must be
+         * followed by exactly the next slots */
+        for (d = need_two ? 0 : -2; d <= (need_two ? 0 : 2); d++) {
+            int64_t p = (int64_t)at + (int64_t)(q - j) + d;
+            if (p >= 0 && p < (int64_t)m->nT && m->T[p].key == key) { good++; break; }
+        }
+    }
+    if (need_two)
+        return good >= 2 || (seen == 1 && good == 1);
+    return good >= 1 || seen == 0;
+}
+
+/* Positions are not unique on a tape (time code restarts, and so can the
+ * absolute track number), so a match close to where we are wins over one
+ * far away: a few frames missing in one input must not be taken for a
+ * jump to another part of the tape that has the same time codes. */
+#define MERGE_NEAR 16
+
+static int is_near(int32_t slot, int32_t cur)
+{
+    return slot > cur && slot <= cur + MERGE_NEAR;
+}
+
+/* does one of the frames after j belong just after 'cur'? */
+static int resyncs_near(const mctx *m, const dv_report *r, int k, uint32_t j, int32_t cur)
+{
+    uint32_t q;
+    for (q = j + 1; q < r->count && q <= j + 8; q++) {
+        int32_t a, t;
+        int64_t key;
+        frame_pos(m, k, q, &a, &t, &key);
+        if (key >= 0 && is_near(find_slot(m, key, cur), cur))
+            return 1;
+    }
+    return 0;
+}
+
+/* attach the frames of input k to the timeline */
+static int align_input(mctx *m, const dv_report *r, int32_t k)
+{
+    mslot *ins = (mslot *)malloc((r->count + 1) * sizeof(mslot));
+    size_t nins = 0, lead = 0, i, o, a;
+    int32_t cur = -1;      /* slot of the previous frame */
+    int in_ins = 0;        /* previous frame went to ins[nins - 1] */
+    int synced = 0;
+    uint32_t j, seq = 0;
+    mslot *N;
+    if (!ins)
+        return -1;
+    rebuild_keys(m);
+    for (j = 0; j < r->count; j++) {
+        int32_t abst, tc, hit = -1, pred;
+        int64_t key;
+        frame_pos(m, k, j, &abst, &tc, &key);
+        pred = (synced && cur + 1 < (int32_t)m->nT) ? cur + 1 : -1;
+        if (key >= 0 && in_ins && ins[nins - 1].key == key) {
+            add_copy(m, &ins[nins - 1], k, j);          /* repeated frame */
+            continue;
+        }
+        if (key >= 0 && synced && !in_ins && cur >= 0 && m->T[cur].key == key)
+            hit = cur;                                   /* repeated frame */
+        else if (key >= 0 && pred >= 0 && m->T[pred].key == key)
+            hit = pred;                                  /* next frame */
+        else {
+            int32_t cand = find_slot(m, key, cur);
+            if (cand >= 0 && synced && !is_near(cand, cur) && resyncs_near(m, r, k, j, cur))
+                cand = -1;                               /* same position elsewhere on the tape */
+            if (cand >= 0 && confirmed(m, r, k, j, cand, 0))
+                hit = cand;                              /* jump, or first frame */
+            else if (pred >= 0 && ((abst >= 0 && m->T[pred].abst == abst) || (tc >= 0 && m->T[pred].tc == tc)))
+                hit = pred;                              /* one of the two values is damaged */
+            else if (pred >= 0 && confirmed(m, r, k, j, pred, 1))
+                hit = pred;                              /* damaged position, sequence goes on */
+        }
+        if (hit >= 0) {
+            add_copy(m, &m->T[hit], k, j);
+            if (!synced)                                 /* frames before the first match go just before it */
+                for (i = 0; i < lead; i++)
+                    ins[i].after = hit - 1;
+            cur = hit;
+            synced = 1;
+            in_ins = 0;
+        } else if (r->frames[j].full_conceal_vid) {
+            /* no picture and no place on the timeline: nothing to add */
+            in_ins = 0;
+        } else {
+            mslot *sl = &ins[nins++];
+            sl->key = key; sl->abst = abst; sl->tc = tc;
+            sl->first = sl->last = -1;
+            sl->after = synced ? cur : 0x7FFFFFFF;
+            sl->seq = seq++;
+            add_copy(m, sl, k, j);
+            if (!synced)
+                lead = nins;
+            in_ins = 1;
+        }
+    }
+    if (!nins) {
+        free(ins);
+        return 0;
+    }
+    /* merge the new slots into the timeline */
+    qsort(ins, nins, sizeof(mslot), mslot_ins_cmp);
+    N = (mslot *)malloc((m->nT + nins) * sizeof(mslot));
+    if (!N) { free(ins); return -1; }
+    o = 0; a = 0;
+    while (a < nins && ins[a].after < 0)
+        N[o++] = ins[a++];
+    for (i = 0; i < m->nT; i++) {
+        N[o++] = m->T[i];
+        while (a < nins && ins[a].after == (int32_t)i)
+            N[o++] = ins[a++];
+    }
+    while (a < nins)
+        N[o++] = ins[a++];
+    free(ins);
+    free(m->T);
+    m->T = N;
+    m->nT = o;
+    return 0;
+}
+
 int dv_merge_files(const char **inputs, int n, const char *output,
                    dv_merge_stats *st, dv_log_cb log, dv_progress_cb progress, void *ctx)
 {
     dv_report *reps;
     FILE **fps;
     FILE *out;
-    mentry *e = NULL;
-    size_t ne = 0, total = 0;
-    int k, mode = 0, ret = 0;
+    mctx m;
+    size_t total = 0;
+    int k, ret = 0;
     uint8_t *best_buf, *cand_buf, *best_st, *cand_st;
     dv_merge_stats dummy;
 
     if (!st)
         st = &dummy;
     memset(st, 0, sizeof(*st));
+    memset(&m, 0, sizeof(m));
     if (n < 1)
         return -1;
     reps = (dv_report *)calloc((size_t)n, sizeof(dv_report));
@@ -136,7 +366,7 @@ int dv_merge_files(const char **inputs, int n, const char *output,
         if (progress && progress(ctx, 0.3 * (k + 1) / n)) { ret = 1; goto done; }
     }
 
-    /* Choose how to line up frames */
+    /* Choose what identifies a frame on the tape */
     {
         int all_abst = 1, all_tc = 1;
         for (k = 0; k < n; k++) {
@@ -148,34 +378,39 @@ int dv_merge_files(const char **inputs, int n, const char *output,
             if (!reps[k].count || a < reps[k].count * 9 / 10) all_abst = 0;
             if (!reps[k].count || t < reps[k].count * 9 / 10) all_tc = 0;
         }
-        mode = all_abst ? 1 : (all_tc ? 0 : 2);
         if (n == 1)
-            mode = 2;
-        st->key_mode = mode;
-        logf_(log, ctx, "Lining up frames by %s", mode == 1 ? "absolute track number" : (mode == 0 ? "time code" : "frame position"));
+            all_abst = all_tc = 0;
+        m.use_abst = all_abst;
+        m.use_tc = all_tc;
+        st->key_mode = all_abst ? 1 : (all_tc ? 0 : 2);
+        logf_(log, ctx, "Lining up frames by %s", all_abst && all_tc ? "absolute track number and time code"
+              : (all_abst ? "absolute track number" : (all_tc ? "time code" : "frame position")));
     }
 
-    e = (mentry *)malloc((total ? total : 1) * sizeof(mentry));
-    if (!e) { ret = -1; goto done; }
-
-    {
-        seg *seg0 = NULL;
-        int nseg0 = 0;
-        for (k = 0; k < n; k++) {
-            dv_report *r = &reps[k];
-            uint32_t cnt = r->count, j;
-            int64_t *val = (int64_t *)malloc((cnt + 1) * sizeof(int64_t));
-            uint8_t *ok = (uint8_t *)malloc(cnt + 1);
+    /* positions of all frames; isolated glitches are replaced by the value
+     * predicted from the frames around */
+    m.pa = (int32_t **)calloc((size_t)n, sizeof(int32_t *));
+    m.pt = (int32_t **)calloc((size_t)n, sizeof(int32_t *));
+    if (!m.pa || !m.pt) { ret = -1; goto done; }
+    for (k = 0; k < n; k++) {
+        dv_report *r = &reps[k];
+        uint32_t cnt = r->count, j;
+        int pass;
+        int64_t *val = (int64_t *)malloc((cnt + 1) * sizeof(int64_t));
+        uint8_t *ok = (uint8_t *)malloc(cnt + 1);
+        m.pa[k] = (int32_t *)malloc((cnt + 1) * sizeof(int32_t));
+        m.pt[k] = (int32_t *)malloc((cnt + 1) * sizeof(int32_t));
+        if (!val || !ok || !m.pa[k] || !m.pt[k]) { free(val); free(ok); ret = -1; goto done; }
+        for (pass = 0; pass < 2; pass++) { /* 0: abst, 1: tc */
             int64_t step = 1;
-            seg *segs = NULL;
-            int nseg = 0, cur_seg = -1, last_mapped = 0;
-            if (!val || !ok) { free(val); free(ok); ret = -1; goto done; }
+            int32_t *dst = pass ? m.pt[k] : m.pa[k];
+            int known = 0;
             for (j = 0; j < cnt; j++) {
                 const dv_frame *f = &r->frames[j];
-                ok[j] = mode == 1 ? f->abst_valid : (mode == 0 ? f->tc_valid : 1);
-                val[j] = mode == 1 ? f->abst : (mode == 0 ? tc_frames(f) : (int64_t)j);
+                ok[j] = pass ? f->tc_valid : f->abst_valid;
+                val[j] = pass ? tc_frames(f) : (int64_t)f->abst;
             }
-            if (mode == 1) {
+            if (!pass) {
                 /* tracks per frame: most common positive difference */
                 int64_t cands[3] = { 10, 12, 15 };
                 int votes[3] = { 0, 0, 0 }, c, b = 0;
@@ -188,68 +423,47 @@ int dv_merge_files(const char **inputs, int n, const char *output,
                 step = votes[b] ? cands[b] : (cnt && r->frames[0].dsf ? 12 : 10);
             }
             smooth_keys(val, ok, cnt, step);
-            if (mode == 0) {
-                /* time code segments: a new one at each confirmed backward jump */
-                int64_t last = 0;
-                segs = (seg *)malloc((cnt + 1) * sizeof(seg));
-                if (!segs) { free(val); free(ok); ret = -1; goto done; }
-                for (j = 0; j < cnt; j++) {
-                    if (!ok[j])
-                        continue;
-                    if (cur_seg < 0 || val[j] < last) {
-                        cur_seg = nseg++;
-                        segs[cur_seg].first = segs[cur_seg].min = segs[cur_seg].max = val[j];
-                    }
-                    if (val[j] < segs[cur_seg].min) segs[cur_seg].min = val[j];
-                    if (val[j] > segs[cur_seg].max) segs[cur_seg].max = val[j];
-                    last = val[j];
-                }
-                if (k == 0) {
-                    for (j = 0; j < (uint32_t)nseg; j++)
-                        segs[j].mapped = (int)j;
-                    seg0 = segs;
-                    nseg0 = nseg;
-                } else {
-                    for (j = 0; j < (uint32_t)nseg; j++) {
-                        int s2, found = -1;
-                        for (s2 = last_mapped; s2 < nseg0 && found < 0; s2++)
-                            if (segs[j].first >= seg0[s2].min && segs[j].first <= seg0[s2].max) found = s2;
-                        for (s2 = 0; s2 < nseg0 && found < 0; s2++)
-                            if (segs[j].first >= seg0[s2].min && segs[j].first <= seg0[s2].max) found = s2;
-                        if (found < 0)
-                            found = last_mapped;
-                        segs[j].mapped = found;
-                        last_mapped = found;
-                    }
-                }
-                /* apply segment numbers */
-                {
-                    int64_t lastv = 0;
-                    cur_seg = -1;
-                    for (j = 0; j < cnt; j++) {
-                        if (ok[j]) {
-                            if (cur_seg < 0 || val[j] < lastv)
-                                cur_seg++;
-                            lastv = val[j];
-                        }
-                        val[j] += (int64_t)(cur_seg < 0 ? 0 : segs[cur_seg].mapped) << 32;
-                    }
-                }
-            }
             for (j = 0; j < cnt; j++) {
-                e[ne].key = val[j];
-                e[ne].input = k;
-                e[ne].frame = j;
-                ne++;
+                if (ok[j])
+                    known = 1;
+                dst[j] = (known && val[j] >= 0 && val[j] < 0x0FFFFFFF) ? (int32_t)val[j] : -1;
             }
-            if (segs && k)
-                free(segs);
-            free(val);
-            free(ok);
         }
-        free(seg0);
+        free(val);
+        free(ok);
     }
-    qsort(e, ne, sizeof(mentry), mentry_cmp);
+
+    m.T = (mslot *)malloc((reps[0].count + 1) * sizeof(mslot));
+    m.C = (mcopy *)malloc((total ? total : 1) * sizeof(mcopy));
+    m.K = (mkey *)malloc((total ? total : 1) * sizeof(mkey));
+    if (!m.T || !m.C || !m.K) { ret = -1; goto done; }
+
+    /* the first input is the timeline; a frame repeated by the deck (same
+     * position as the frame before) is one slot */
+    {
+        uint32_t j;
+        for (j = 0; j < reps[0].count; j++) {
+            int32_t abst, tc;
+            int64_t key;
+            mslot *sl;
+            frame_pos(&m, 0, j, &abst, &tc, &key);
+            if (n > 1 && m.nT && key >= 0 && m.T[m.nT - 1].key == key) {
+                add_copy(&m, &m.T[m.nT - 1], 0, j);
+                continue;
+            }
+            sl = &m.T[m.nT++];
+            sl->key = key; sl->abst = abst; sl->tc = tc;
+            sl->first = sl->last = -1;
+            sl->after = 0; sl->seq = 0;
+            add_copy(&m, sl, 0, j);
+        }
+    }
+    for (k = 1; k < n; k++) {
+        size_t before = m.nT;
+        if (align_input(&m, &reps[k], k) < 0) { ret = -1; goto done; }
+        if (m.nT > before)
+            logf_(log, ctx, "Input %d has %lu frame(s) that are in no earlier input", k + 1, (unsigned long)(m.nT - before));
+    }
 
     for (k = 0; k < n; k++) {
         fps[k] = fopen(inputs[k], "rb");
@@ -262,51 +476,49 @@ int dv_merge_files(const char **inputs, int n, const char *output,
         goto done;
     }
 
-    /* Pass 2: one output frame per key */
+    /* Pass 2: one output frame per slot */
     {
-        size_t g = 0;
-        int64_t last_key = 0;
-        int have_last = 0;
-        while (g < ne) {
-            size_t h = g, c, best = (size_t)-1;
+        size_t g;
+        int32_t last_tc = -1;
+        for (g = 0; g < m.nT; g++) {
+            int32_t c, best = -1, copies = 0;
             const dv_frame *bf;
             uint32_t remaining = 0, fixed = 0;
-            while (h < ne && e[h].key == e[g].key)
-                h++;
-            /* missing frames (time code mode, same segment) */
-            if (have_last && mode == 0 && (e[g].key >> 32) == (last_key >> 32) && e[g].key > last_key + 1)
-                st->frames_missing += (uint32_t)(e[g].key - last_key - 1);
-            if (have_last && mode == 1 && e[g].key > last_key + 2 * ((reps[0].count && reps[0].frames[0].dsf) ? 12 : 10))
-                st->frames_missing++;
-            last_key = e[g].key;
-            have_last = 1;
 
-            for (c = g; c < h; c++) {
-                const dv_frame *f = &reps[e[c].input].frames[e[c].frame];
-                if (best == (size_t)-1) { best = c; continue; }
-                bf = &reps[e[best].input].frames[e[best].frame];
+            for (c = m.T[g].first; c >= 0; c = m.C[c].next) {
+                const dv_frame *f = &reps[m.C[c].input].frames[m.C[c].frame];
+                copies++;
+                if (best < 0) { best = c; continue; }
+                bf = &reps[m.C[best].input].frames[m.C[best].frame];
                 {
                     int fc_f = f->full_conceal_vid, fc_b = bf->full_conceal_vid;
                     if ((fc_b && !fc_f) || (fc_b == fc_f && dv_frame_error_blocks(f) < dv_frame_error_blocks(bf)))
                         best = c;
                 }
             }
-            bf = &reps[e[best].input].frames[e[best].frame];
-            if (bf->size > DV_MAX_FRAME * 4 || fseeko(fps[e[best].input], bf->pos, SEEK_SET)
-                || fread(best_buf, 1, bf->size, fps[e[best].input]) != bf->size) {
-                logf_(log, ctx, "Error: read issue in %s", inputs[e[best].input]);
+            bf = &reps[m.C[best].input].frames[m.C[best].frame];
+            /* frames missing in every input: small forward steps of the time code */
+            if (bf->tc_valid) {
+                int32_t t = (int32_t)tc_frames(bf);
+                if (last_tc >= 0 && t > last_tc + 1 && t <= last_tc + 250)
+                    st->frames_missing += (uint32_t)(t - last_tc - 1);
+                last_tc = t;
+            }
+            if (bf->size > DV_MAX_FRAME * 4 || fseeko(fps[m.C[best].input], bf->pos, SEEK_SET)
+                || fread(best_buf, 1, bf->size, fps[m.C[best].input]) != bf->size) {
+                logf_(log, ctx, "Error: read issue in %s", inputs[m.C[best].input]);
                 ret = -1;
                 break;
             }
-            if (dv_frame_error_blocks(bf) && h - g > 1) {
+            if (dv_frame_error_blocks(bf) && copies > 1) {
                 int qu = bf->bitdepth == 12 ? 1 : (bf->bitdepth == 16 ? 0 : -1);
                 uint32_t nb = bf->size / DV_BLOCK_SIZE, b;
                 dv_block_status(best_buf, bf->size, qu, best_st);
-                for (c = g; c < h; c++) {
-                    const dv_frame *f = &reps[e[c].input].frames[e[c].frame];
+                for (c = m.T[g].first; c >= 0; c = m.C[c].next) {
+                    const dv_frame *f = &reps[m.C[c].input].frames[m.C[c].frame];
                     if (c == best || f->size != bf->size)
                         continue;
-                    if (fseeko(fps[e[c].input], f->pos, SEEK_SET) || fread(cand_buf, 1, f->size, fps[e[c].input]) != f->size)
+                    if (fseeko(fps[m.C[c].input], f->pos, SEEK_SET) || fread(cand_buf, 1, f->size, fps[m.C[c].input]) != f->size)
                         continue;
                     dv_block_status(cand_buf, f->size, qu, cand_st);
                     for (b = 0; b < nb; b++) {
@@ -342,14 +554,13 @@ int dv_merge_files(const char **inputs, int n, const char *output,
                 char tc[16];
                 dv_format_tc(tc, bf);
                 logf_(log, ctx, "frame %6u %-11s input %d of %d copies: %4u bad blocks, %4u fixed from other takes, %4u remaining",
-                      st->frames_out - 1, tc[0] ? tc : "--", e[best].input + 1, (int)(h - g),
+                      st->frames_out - 1, tc[0] ? tc : "--", m.C[best].input + 1, (int)copies,
                       dv_frame_error_blocks(bf), fixed, remaining);
             }
-            if (progress && (st->frames_out % 100) == 0 && progress(ctx, 0.3 + 0.7 * (double)h / (double)ne)) {
+            if (progress && (st->frames_out % 100) == 0 && progress(ctx, 0.3 + 0.7 * (double)(g + 1) / (double)m.nT)) {
                 ret = 1;
                 break;
             }
-            g = h;
         }
     }
     if (fclose(out))
@@ -370,7 +581,15 @@ done:
             if (fps[k]) fclose(fps[k]);
     free(reps);
     free(fps);
-    free(e);
+    if (m.pa)
+        for (k = 0; k < n; k++) free(m.pa[k]);
+    if (m.pt)
+        for (k = 0; k < n; k++) free(m.pt[k]);
+    free(m.pa);
+    free(m.pt);
+    free(m.T);
+    free(m.C);
+    free(m.K);
     free(best_buf);
     free(cand_buf);
     free(best_st);
