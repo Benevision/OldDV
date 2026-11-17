@@ -361,6 +361,17 @@ int dv_merge_files(const char **inputs, int n, const char *output,
             ret = -1;
             goto done;
         }
+        /* a capture that was cut off (crash, power cut) ends in a part of a
+         * frame: it must not get into the output */
+        while (reps[k].count) {
+            dv_frame *lf = &reps[k].frames[reps[k].count - 1];
+            if (lf->size >= (lf->dsf ? 144000u : 120000u))
+                break;
+            logf_(log, ctx, "  the last frame is incomplete (%u bytes, interrupted capture?): ignored", lf->size);
+            free(lf->sta);
+            lf->sta = NULL;
+            reps[k].count--;
+        }
         logf_(log, ctx, "  %u frames, %u with issues", reps[k].count, reps[k].frames_with_errors);
         total += reps[k].count;
         if (progress && progress(ctx, 0.3 * (k + 1) / n)) { ret = 1; goto done; }
@@ -476,6 +487,7 @@ int dv_merge_files(const char **inputs, int n, const char *output,
         goto done;
     }
 
+#define FRAME_SHORT(f) ((f)->size < ((f)->dsf ? 144000u : 120000u))
     /* Pass 2: one output frame per slot */
     {
         size_t g;
@@ -492,11 +504,22 @@ int dv_merge_files(const char **inputs, int n, const char *output,
                 bf = &reps[m.C[best].input].frames[m.C[best].frame];
                 {
                     int fc_f = f->full_conceal_vid, fc_b = bf->full_conceal_vid;
-                    if ((fc_b && !fc_f) || (fc_b == fc_f && dv_frame_error_blocks(f) < dv_frame_error_blocks(bf)))
+                    int sh_f = FRAME_SHORT(f), sh_b = FRAME_SHORT(bf);
+                    if (sh_f != sh_b) {
+                        if (sh_b)
+                            best = c;
+                    } else if ((fc_b && !fc_f) || (fc_b == fc_f && dv_frame_error_blocks(f) < dv_frame_error_blocks(bf)))
                         best = c;
                 }
             }
             bf = &reps[m.C[best].input].frames[m.C[best].frame];
+            /* a part of a frame (data lost during the capture) would shift
+             * everything after it in the output: leave it out */
+            if (FRAME_SHORT(bf)) {
+                logf_(log, ctx, "frame %6u: only an incomplete copy (%u bytes): left out", (unsigned)g, bf->size);
+                st->frames_missing++;
+                continue;
+            }
             /* frames missing in every input: small forward steps of the time code */
             if (bf->tc_valid) {
                 int32_t t = (int32_t)tc_frames(bf);

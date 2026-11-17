@@ -59,6 +59,11 @@ python3 tests/inject.py "$W/two.dv" "$W/two_b.dv" 6
 "$OLDDV" "$W/two.dv" "$W/two_a.dv" -m "$W/two_m.dv" 2>/dev/null
 check "merge with a clean first take returns it unchanged" "cmp -s $W/two.dv $W/two_m.dv"
 "$OLDDV" "$W/two_a.dv" "$W/two_b.dv" "$W/two.dv" -m "$W/two_m2.dv" -s 2>/dev/null > "$W/m2.txt"
+# a take that was cut off in the middle of a frame (interrupted capture)
+head -c 12050000 "$W/take2.dv" > "$W/cut.dv"
+"$OLDDV" "$W/take1.dv" "$W/cut.dv" -m "$W/cut_m.dv" > /dev/null 2>&1
+check "merge ignores the incomplete last frame of a cut-off take" "[ \$(( \$(wc -c < $W/cut_m.dv) % 120000 )) -eq 0 ]"
+
 check "merge with repeated time codes keeps all 358 frames" "grep -q 'Frames: *358' $W/m2.txt"
 check "merge with repeated time codes repairs everything" "grep -q 'Frames with issues: *0' $W/m2.txt || grep -q 'video errors: *0 frames' $W/m2.txt"
 
