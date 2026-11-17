@@ -27,7 +27,7 @@ and DVRescue's Qt player/GUI.
 
 ### Option A: prebuilt app
 
-1. Copy `dist/OldDV-Rescue-1.0.1-mac.zip` to the Mac and double-click it.
+1. Copy `dist/OldDV-Rescue-1.0.2-mac.zip` to the Mac and double-click it.
 2. Drag **OldDV Rescue.app** to *Applications*.
 3. On 10.6 it just opens. On 10.8+ Gatekeeper may say the app is from an unidentified
    developer: right-click (Ctrl-click) the app, choose **Open**, then confirm once.
@@ -95,6 +95,14 @@ on 10.6 as well.
 
 Each `.dv` file gets a `.dv.dvrescue.xml` report next to it, and the Capture log is saved
 as `name.log` in the same folder (and always in `~/Library/Logs/OldDV Rescue.log`).
+The log gets a progress line every 5 minutes and a line when a blank section starts or
+ends. While the tape is blank, the status shows `REC, blank 130/360 s`: the seconds without
+a picture, and the limit at which the capture finishes by itself if the deck keeps playing.
+
+If the app or the Mac dies during a capture, the `.dv` is still good up to the last data
+written. Only the XML report is missing: open the file in the *Analyze* tab, or run
+`olddv name.dv -x name.dv.dvrescue.xml`.
+
 The raw `.dv` is your preservation master. Keep it even if you make a merged or packaged
 version.
 

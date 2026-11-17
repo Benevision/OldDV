@@ -543,7 +543,17 @@ static void log_to_main(void *ctx, const char *line)
     }
     switch (st) {
     case OVEngineMonitoring: status = s.secondsSinceData >= 0 && s.secondsSinceData < 1 ? @"Receiving (not recording)" : @"Connected, no signal"; break;
-    case OVEngineRecording: status = s.secondsSinceData >= 0 && s.secondsSinceData < 1 ? @"RECORDING" : @"RECORDING (waiting for signal)"; break;
+    case OVEngineRecording:
+        if (s.secondsSinceData < 0 || s.secondsSinceData >= 1)
+            status = @"RECORDING (waiting for signal)";
+        else if (s.secondsSinceSignal > 5 && [engine blankLimit] > 0)
+            status = [NSString stringWithFormat:@"REC, blank %.0f/%.0f s",
+                      s.secondsSinceSignal, [engine blankLimit]];
+        else if (s.secondsSinceSignal > 5)
+            status = [NSString stringWithFormat:@"REC, blank %.0f s", s.secondsSinceSignal];
+        else
+            status = @"RECORDING";
+        break;
     case OVEngineRetrying: status = @"Re-reading bad sections"; break;
     case OVEngineMerging: status = @"Merging takes"; break;
     default: status = @"Not connected";

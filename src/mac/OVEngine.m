@@ -407,6 +407,8 @@ static void append_line(NSString *path, NSString *text)
     [takes addObject:path];
     retryCount = retries;
     noDataTimeout = seconds > 0 ? seconds : 0;
+    blankLogged = NO;
+    lastProgressLog = now_s();
     cancel = NO;
     autoStopDeck = play;
     pthread_mutex_lock(&mtx);
@@ -488,6 +490,15 @@ static void append_line(NSString *path, NSString *text)
     }
 }
 
+/* Seconds without a picture after which a capture ends although the deck
+ * still plays (blank tape); 0 when the automatic finish is off. */
+- (double)blankLimit
+{
+    if (noDataTimeout <= 0)
+        return 0;
+    return noDataTimeout * 6 > 90 ? noDataTimeout * 6 : 90;
+}
+
 - (void)tick
 {
     double t = now_s();
@@ -503,6 +514,22 @@ static void append_line(NSString *path, NSString *text)
     }
     if (state == OVEngineRecording) {
         OVLiveStats s = [self stats];
+        /* Blank sections and a progress line every 5 minutes go to the log:
+         * after a crash or a power cut the log shows how far the capture got. */
+        if (!blankLogged && s.secondsSinceSignal > 10) {
+            blankLogged = YES;
+            [self log:[NSString stringWithFormat:@"Blank or frozen picture since about frame %u.",
+                       s.framesRecorded > s.deadFrames ? s.framesRecorded - s.deadFrames : 0]];
+        } else if (blankLogged && s.secondsSinceSignal >= 0 && s.secondsSinceSignal < 2) {
+            blankLogged = NO;
+            [self log:[NSString stringWithFormat:@"Picture is back at frame %u.", s.framesRecorded]];
+        }
+        if (t - lastProgressLog > 300) {
+            lastProgressLog = t;
+            [self log:[NSString stringWithFormat:@"Progress: %u frames, %u with issues, %.1f MB waiting to be written, deck %@",
+                       s.framesRecorded, s.framesWithErrors, s.bufferedBytes / 1048576.0,
+                       deck ? [OVDeck describeState:(OVDeckState)deckStateCache] : @"not controlled"]];
+        }
         if (writeError) {
             [self log:@"Write error (disk full, or network share disconnected?): capture stopped."];
             cancel = YES;
@@ -515,7 +542,7 @@ static void append_line(NSString *path, NSString *text)
              * has stopped, this is the end. If it still plays, it may be a
              * blank section between two recordings: wait much longer. */
             BOOL stopped = deck && (deckStateCache == OVDeckStopped || deckStateCache == OVDeckNoTape);
-            double limit = noDataTimeout * 6 > 90 ? noDataTimeout * 6 : 90;
+            double limit = [self blankLimit];
             if (stopped || s.secondsSinceSignal > limit) {
                 [self log:[NSString stringWithFormat:@"No picture for %.0f seconds (%@): finishing. "
                            @"The last %u frames of the file are blank or repeated.", s.secondsSinceSignal,

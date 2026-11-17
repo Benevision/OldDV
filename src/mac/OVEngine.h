@@ -85,6 +85,8 @@ typedef struct OVLiveStats {
     NSString *baseName;     /* full path without .dv */
     int retryCount;
     double noDataTimeout;
+    BOOL blankLogged;
+    double lastProgressLog;
     BOOL cancel;
     BOOL autoStopDeck;
     int deckStateCache;
@@ -99,6 +101,7 @@ typedef struct OVLiveStats {
 - (OVEngineState)state;
 
 /* basePath: folder/name without extension. retries: extra passes over bad sections */
+- (double)blankLimit;
 - (BOOL)startRecordingTo:(NSString *)basePath retries:(int)retries noDataTimeout:(double)seconds
                 playDeck:(BOOL)play error:(NSString **)err;
 - (void)stopRecording;          /* user stop (also cancels retries) */
