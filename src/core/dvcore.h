@@ -23,7 +23,7 @@
 extern "C" {
 #endif
 
-#define OLDDV_VERSION "1.4.0"
+#define OLDDV_VERSION "1.4.1"
 
 #define DV_BLOCK_SIZE   80
 #define DV_DSEQ_SIZE    12000          /* 150 blocks of 80 bytes */

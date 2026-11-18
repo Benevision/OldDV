@@ -29,7 +29,7 @@ retrying a bad section during the first pass: the re-reads run as passes after i
 
 ### Option A: prebuilt app
 
-1. Copy `dist/OldDV-Rescue-1.4.0-mac.zip` to the Mac and double-click it.
+1. Copy `dist/OldDV-Rescue-1.4.1-mac.zip` to the Mac and double-click it.
 2. Drag **OldDV Rescue.app** to *Applications*.
 3. On 10.6 it just opens. On 10.8+ Gatekeeper may say the app is from an unidentified
    developer: right-click (Ctrl-click) the app, choose **Open**, then confirm once.

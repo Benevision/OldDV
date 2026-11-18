@@ -86,6 +86,8 @@ static NSTextView *mkTextView(NSView *parent, NSRect r, NSUInteger mask)
     tv = [[[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, cs.width, cs.height)] autorelease];
     [tv setEditable:NO];
     [tv setFont:[NSFont userFixedPitchFontOfSize:11]];
+    [tv setTextColor:[NSColor textColor]];
+    [tv setTextContainerInset:NSMakeSize(2, 4)];
     [tv setMinSize:NSMakeSize(0, cs.height)];
     [tv setMaxSize:NSMakeSize(FLT_MAX, FLT_MAX)];
     [tv setVerticallyResizable:YES];
@@ -100,7 +102,9 @@ static NSTextView *mkTextView(NSView *parent, NSRect r, NSUInteger mask)
 
 static void appendText(NSTextView *tv, NSString *line)
 {
-    NSDictionary *a = [NSDictionary dictionaryWithObject:[NSFont userFixedPitchFontOfSize:11] forKey:NSFontAttributeName];
+    /* textColor follows the appearance (white on the dark windows of current systems) */
+    NSDictionary *a = [NSDictionary dictionaryWithObjectsAndKeys:[NSFont userFixedPitchFontOfSize:11], NSFontAttributeName,
+                       [NSColor textColor], NSForegroundColorAttributeName, nil];
     NSAttributedString *s = [[[NSAttributedString alloc] initWithString:[line stringByAppendingString:@"\n"] attributes:a] autorelease];
     [[tv textStorage] appendAttributedString:s];
     [tv scrollRangeToVisible:NSMakeRange([[tv string] length], 0)];
@@ -288,7 +292,8 @@ static void log_to_main(void *ctx, const char *line)
     connectButton = mkButton(v, NSMakeRect(x + 400, y - 6, 100, 32), @"Connect", self, @selector(connect:));
     y -= 24;
     connLabel = mkLabel(v, NSMakeRect(x, y, W - x - 12, 18), @"Not connected");
-    [connLabel setTextColor:[NSColor darkGrayColor]];
+    [connLabel setTextColor:[NSColor respondsToSelector:@selector(secondaryLabelColor)]
+        ? [NSColor performSelector:@selector(secondaryLabelColor)] : [NSColor darkGrayColor]];
     y -= 34;
     mkLabel(v, NSMakeRect(x, y, 90, 18), @"Save to:");
     folderField = mkField(v, NSMakeRect(x + 95, y - 2, 300, 22), [defs stringForKey:@"folder"]);
