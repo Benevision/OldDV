@@ -63,7 +63,9 @@ comes after the capture. `./build.sh` notices the missing QTKit and builds
 `build/modern/OldDV Rescue.app` for the Mac it runs on (needs Xcode or the command line
 tools): Analyze, Merge Takes (with **Open Capture...**), Package & Export and the player,
 which is silent there because the system does not decode the sound of a raw DV stream.
-This build does not run on the old Mac, and the old Mac's build does not run here.
+This build does not run on the old Mac. The old Mac's build still opens on a current Mac
+while Rosetta is there (Intel code, and the system keeps an empty QTKit), and can merge
+and export, but more slowly and most likely without pictures: QuickTime's decoders are gone.
 
 ## Hardware setup
 
