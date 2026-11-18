@@ -23,7 +23,8 @@ typedef enum {
     OVEngineMonitoring,
     OVEngineRecording,
     OVEngineRetrying,
-    OVEngineMerging
+    OVEngineMerging,
+    OVEngineCopying     /* moving the finished capture from this Mac to its destination */
 } OVEngineState;
 
 @class OVEngine;
@@ -44,6 +45,9 @@ typedef struct OVLiveStats {
     uint64_t droppedBytes;   /* lost because the destination was too slow */
     double   secondsSinceData;
     uint32_t deadFrames;     /* blank / repeated frames at the end of the file */
+    int      copying;        /* 1: recorded on this Mac and copied to the destination in the background */
+    int64_t  copyBehind;     /* bytes not yet at the destination */
+    int      copyFailing;    /* the destination does not answer right now */
     double   secondsSinceSignal; /* since the last frame with a moving, readable picture; -1: none yet */
 } OVLiveStats;
 
@@ -86,6 +90,11 @@ typedef struct OVLiveStats {
     int retryCount;
     double noDataTimeout;
     BOOL blankLogged;
+    NSString *destFolder;   /* nil: record straight into the chosen folder */
+    NSString *resultFolder; /* where the files of the last capture ended up */
+    dv_mirror *mirror;      /* background copy of the main capture file */
+    BOOL mirrorFailing;
+    BOOL cancelCopy;
     double lastProgressLog;
     BOOL cancel;
     BOOL autoStopDeck;
@@ -102,6 +111,13 @@ typedef struct OVLiveStats {
 
 /* basePath: folder/name without extension. retries: extra passes over bad sections */
 - (double)blankLimit;
+/* Record on this Mac (the folder of basePath) and copy everything to
+ * `folder` in the background; nil records straight to basePath. Call
+ * before -startRecordingTo:. */
+- (void)setCopyDestination:(NSString *)folder;
+/* the main capture file where it ended up (destination, or this Mac if
+ * the copy did not succeed); nil before the first capture */
+- (NSString *)resultPath;
 - (BOOL)startRecordingTo:(NSString *)basePath retries:(int)retries noDataTimeout:(double)seconds
                 playDeck:(BOOL)play error:(NSString **)err;
 - (void)stopRecording;          /* user stop (also cancels retries) */

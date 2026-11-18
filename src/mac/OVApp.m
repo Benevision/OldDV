@@ -11,6 +11,8 @@
 #import "OVViews.h"
 #include <math.h>
 #include <sys/stat.h>
+#include <sys/param.h>
+#include <sys/mount.h>
 
 #define OLDDV_VERSION_NS @OLDDV_VERSION
 
@@ -363,7 +365,8 @@ static void log_to_main(void *ctx, const char *line)
 {
     NSString *err = nil;
     NSInteger i = [devicePopup indexOfSelectedItem];
-    if ([engine state] == OVEngineRecording || [engine state] == OVEngineRetrying || [engine state] == OVEngineMerging)
+    if ([engine state] == OVEngineRecording || [engine state] == OVEngineRetrying || [engine state] == OVEngineMerging
+        || [engine state] == OVEngineCopying)
         return;
     [self refreshDevices:nil];
     i = [devicePopup indexOfSelectedItem];
@@ -439,13 +442,46 @@ static void log_to_main(void *ctx, const char *line)
 - (void)deckPlay:(id)s { [self deckDo:@selector(play)]; }
 - (void)deckFF:(id)s { [self deckDo:@selector(fastForward)]; }
 
+/* captures for a network folder are recorded here first */
+- (NSString *)cacheFolder
+{
+    return [NSHomeDirectory() stringByAppendingPathComponent:@"Movies/OldDV Rescue Cache"];
+}
+
+/* YES when the folder is not on a disk of this Mac (NFS, SMB, AFP...) */
+static BOOL OVFolderIsRemote(NSString *folder)
+{
+    struct statfs sf;
+    if (statfs([folder fileSystemRepresentation], &sf))
+        return NO;
+    return (sf.f_flags & MNT_LOCAL) == 0;
+}
+
+/* captures that never reached their folder (crash, share gone) */
+- (void)reportCacheLeftovers
+{
+    NSMutableArray *left = [NSMutableArray array];
+    for (NSString *n in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:[self cacheFolder] error:NULL])
+        if ([[n pathExtension] isEqualToString:@"dv"])
+            [left addObject:n];
+    if ([left count])
+        appendText(captureLog, [NSString stringWithFormat:@"Captures that were not copied to their folder are still on this Mac, in %@: %@",
+                                [self cacheFolder], [left componentsJoinedByString:@", "]]);
+}
+
 - (void)toggleCapture:(id)s
 {
     OVEngineState st = [engine state];
-    NSString *folder, *name, *err = nil;
+    NSString *folder, *name, *err = nil, *recFolder;
     int retries[5] = { 0, 1, 2, 3, 5 };
     if (st == OVEngineRecording || st == OVEngineRetrying) {
         [engine stopRecording];
+        return;
+    }
+    if (st == OVEngineCopying) {
+        if (NSRunAlertPanel(@"Stop the copy?", @"The capture stays complete on this Mac, in %@. You can copy it to its folder later.",
+                            @"Keep copying", @"Stop the copy", nil, [self cacheFolder]) != NSAlertDefaultReturn)
+            [engine stopRecording];
         return;
     }
     if (st == OVEngineMerging)
@@ -470,6 +506,29 @@ static void log_to_main(void *ctx, const char *line)
     [defs setObject:[timeoutField stringValue] forKey:@"timeout"];
     [defs setInteger:[retryPopup indexOfSelectedItem] forKey:@"retries"];
     [defs setBool:[autoPlayCheck state] == NSOnState forKey:@"autoplay"];
+    /* A folder on a network share: record on this Mac and copy in the
+     * background, so that a share that stalls or drops cannot hurt the
+     * capture. */
+    recFolder = folder;
+    if (OVFolderIsRemote(folder)) {
+        NSString *cache = [self cacheFolder];
+        NSDictionary *ca;
+        long long cfree;
+        [[NSFileManager defaultManager] createDirectoryAtPath:cache withIntermediateDirectories:YES attributes:nil error:NULL];
+        ca = [[NSFileManager defaultManager] attributesOfFileSystemForPath:cache error:NULL];
+        cfree = [[ca objectForKey:NSFileSystemFreeSize] longLongValue];
+        if (!ca || cfree < 15000000000LL) {
+            NSInteger r = NSRunAlertPanel(@"Not enough room on this Mac",
+                @"The folder is on a network share. To be safe from network problems the capture is first recorded on this Mac, "
+                @"but only %@ are free here (one hour of DV needs about 13 GB).\n\nYou can record straight to the share: "
+                @"if the share stops answering, the rest of the tape is lost.",
+                @"Cancel", @"Record straight to the share", nil, fmtBytes(cfree));
+            if (r == NSAlertDefaultReturn)
+                return;
+        } else
+            recFolder = cache;
+    }
+    [engine setCopyDestination:recFolder == folder ? nil : folder];
     {
         NSDictionary *fsa = [[NSFileManager defaultManager] attributesOfFileSystemForPath:folder error:NULL];
         long long freeb = [[fsa objectForKey:NSFileSystemFreeSize] longLongValue];
@@ -478,7 +537,7 @@ static void log_to_main(void *ctx, const char *line)
                             fmtBytes(freeb)) != NSAlertDefaultReturn)
             return;
     }
-    if (![engine startRecordingTo:[folder stringByAppendingPathComponent:name]
+    if (![engine startRecordingTo:[recFolder stringByAppendingPathComponent:name]
                           retries:retries[[retryPopup indexOfSelectedItem] < 5 ? [retryPopup indexOfSelectedItem] : 0]
                     noDataTimeout:[timeoutField doubleValue]
                          playDeck:[autoPlayCheck state] == NSOnState error:&err]) {
@@ -486,7 +545,7 @@ static void log_to_main(void *ctx, const char *line)
         return;
     }
     [lastCapture release];
-    lastCapture = [[[folder stringByAppendingPathComponent:name] stringByAppendingPathExtension:@"dv"] retain];
+    lastCapture = [[[recFolder stringByAppendingPathComponent:name] stringByAppendingPathExtension:@"dv"] retain];
     [liveGraph clear];
     graphCopied = 0;
 }
@@ -515,8 +574,13 @@ static void log_to_main(void *ctx, const char *line)
 - (void)engineStateDidChange:(OVEngine *)e
 {
     OVEngineState st = [engine state];
-    BOOL running = st == OVEngineRecording || st == OVEngineRetrying || st == OVEngineMerging;
-    [captureButton setTitle:running ? (st == OVEngineMerging ? @"Merging..." : @"Stop Capture") : @"Start Capture"];
+    BOOL running = st == OVEngineRecording || st == OVEngineRetrying || st == OVEngineMerging || st == OVEngineCopying;
+    [captureButton setTitle:running ? (st == OVEngineMerging ? @"Merging..." : (st == OVEngineCopying ? @"Stop Copy" : @"Stop Capture")) : @"Start Capture"];
+    if (!running && wasRunning && [engine resultPath]) {
+        /* the capture may have moved from this Mac to its folder */
+        [lastCapture release];
+        lastCapture = [[engine resultPath] retain];
+    }
     [captureButton setEnabled:st != OVEngineMerging];
     [devicePopup setEnabled:!running && [deviceList count]];
     [enginePopup setEnabled:!running];
@@ -556,6 +620,7 @@ static void log_to_main(void *ctx, const char *line)
         break;
     case OVEngineRetrying: status = @"Re-reading bad sections"; break;
     case OVEngineMerging: status = @"Merging takes"; break;
+    case OVEngineCopying: status = @"Copying to the folder"; break;
     default: status = @"Not connected";
     }
     [statsLabel setStringValue:[NSString stringWithFormat:
@@ -563,7 +628,10 @@ static void log_to_main(void *ctx, const char *line)
         status, tc[0] ? tc : "--", rd[0] ? rd : "--", s.framesRecorded,
         fmtDuration(s.framesRecorded, s.haveFrame && s.last.dsf), fmtBytes(s.fileBytes),
         s.droppedBytes ? [NSString stringWithFormat:@"\nDROPPED:   %@ (disk too slow)", fmtBytes((int64_t)s.droppedBytes)]
-        : (s.bufferedBytes > 4000000 ? [NSString stringWithFormat:@"\nBuffered:  %@ (disk/share slow)", fmtBytes(s.bufferedBytes)] : @"")]];
+        : (s.bufferedBytes > 4000000 ? [NSString stringWithFormat:@"\nBuffered:  %@ (disk/share slow)", fmtBytes(s.bufferedBytes)]
+        : (st == OVEngineRecording && s.copying ?
+            (s.copyFailing ? [NSString stringWithFormat:@"\nSHARE DOWN, safe here: %@", fmtBytes(s.copyBehind)]
+                           : [NSString stringWithFormat:@"\nTo copy:   %@", fmtBytes(s.copyBehind)]) : @""))]];
     [statsLabel2 setStringValue:[NSString stringWithFormat:
         @"Frames with issues: %u\nTime code breaks:   %u\nNew recordings:     %u\nThis frame: %@%@",
         s.framesWithErrors, s.tcBreaks, s.recStarts,
@@ -1396,6 +1464,7 @@ static void log_to_main(void *ctx, const char *line)
     appendText(captureLog, [NSString stringWithFormat:@"OldDV Rescue %@ - capture engines: %@%@", OLDDV_VERSION_NS,
                             [OVCaptureBackend qtKitAvailable] ? @"QTKit " : @"",
                             [OVCaptureBackend avFoundationAvailable] ? @"AVFoundation" : @""]);
+    [self reportCacheLeftovers];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(deviceNotification:) name:QTCaptureDeviceWasConnectedNotification object:nil];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(deviceNotification:) name:QTCaptureDeviceWasDisconnectedNotification object:nil];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(deviceNotification:) name:@"AVCaptureDeviceWasConnectedNotification" object:nil];
@@ -1417,6 +1486,10 @@ static void log_to_main(void *ctx, const char *line)
         if (NSRunAlertPanel(@"Capture running", @"Stop the capture and quit?", @"Stop and Quit", @"Cancel", nil) != NSAlertDefaultReturn)
             return NSTerminateCancel;
         [engine stopRecording];
+    } else if (st == OVEngineCopying) {
+        if (NSRunAlertPanel(@"Copy running", @"The capture is still being copied to its folder. If you quit, it stays complete on this Mac, in %@.",
+                            @"Keep copying", @"Quit", nil, [self cacheFolder]) == NSAlertDefaultReturn)
+            return NSTerminateCancel;
     }
     return NSTerminateNow;
 }

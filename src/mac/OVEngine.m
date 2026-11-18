@@ -72,6 +72,9 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t size, int64_t pos)
     dispatch_release(deckQueue);
     dispatch_release(logQueue);
     [logPath release];
+    [destFolder release];
+    [resultFolder release];
+    dv_mirror_free(mirror);
     pthread_mutex_destroy(&mtx);
     [super dealloc];
 }
@@ -178,7 +181,7 @@ static void append_line(NSString *path, NSString *text)
     deck = nil;
     [deviceID release];
     deviceID = nil;
-    if (state != OVEngineMerging && state != OVEngineRetrying)
+    if (state != OVEngineMerging && state != OVEngineRetrying && state != OVEngineCopying)
         state = OVEngineIdle;
 }
 
@@ -283,6 +286,13 @@ static void append_line(NSString *path, NSString *text)
     s.droppedBytes = droppedBytes;
     s.deadFrames = deadFrames;
     s.secondsSinceData = lastDataTime ? now_s() - lastDataTime : -1;
+    if (mirror) {
+        dv_mirror_info mi;
+        dv_mirror_status(mirror, &mi);
+        s.copying = 1;
+        s.copyBehind = fileBytes > mi.copied ? fileBytes - mi.copied : 0;
+        s.copyFailing = mi.failing || mi.seconds_idle > 20;
+    }
     s.secondsSinceSignal = (signalSeen && lastSignalTime) ? now_s() - lastSignalTime : -1;
     pthread_mutex_unlock(&mtx);
     return s;
@@ -391,7 +401,7 @@ static void append_line(NSString *path, NSString *text)
         if (err) *err = @"No device connected.";
         return NO;
     }
-    if (state == OVEngineRecording || state == OVEngineRetrying || state == OVEngineMerging) {
+    if (state == OVEngineRecording || state == OVEngineRetrying || state == OVEngineMerging || state == OVEngineCopying) {
         if (err) *err = @"A capture is already running.";
         return NO;
     }
@@ -399,8 +409,27 @@ static void append_line(NSString *path, NSString *text)
         if (err) *err = [NSString stringWithFormat:@"%@ already exists, choose another name.", [path lastPathComponent]];
         return NO;
     }
+    [resultFolder release];
+    resultFolder = nil;
+    if (destFolder) {
+        NSString *dst = [destFolder stringByAppendingPathComponent:[path lastPathComponent]];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:dst]) {
+            if (err) *err = [NSString stringWithFormat:@"%@ already exists in %@, choose another name.", [path lastPathComponent], destFolder];
+            return NO;
+        }
+    }
     if (![self openFile:path error:err])
         return NO;
+    dv_mirror_free(mirror);
+    mirror = NULL;
+    mirrorFailing = NO;
+    cancelCopy = NO;
+    if (destFolder) {
+        mirror = dv_mirror_start([path fileSystemRepresentation],
+                                 [[destFolder stringByAppendingPathComponent:[path lastPathComponent]] fileSystemRepresentation]);
+        resultFolder = [[path stringByDeletingLastPathComponent] copy];
+    } else
+        resultFolder = [[path stringByDeletingLastPathComponent] copy];
     [baseName release];
     baseName = [basePath copy];
     [takes removeAllObjects];
@@ -428,6 +457,9 @@ static void append_line(NSString *path, NSString *text)
                deck ? [deck name] : @"none"]];
     [self log:[NSString stringWithFormat:@"Recording to %@ (finish after %.0f s without signal, %d retry pass(es), %@)",
                path, noDataTimeout, retryCount, play ? @"deck started by the app" : @"deck not started by the app"]];
+    if (destFolder)
+        [self log:[NSString stringWithFormat:@"The capture is recorded on this Mac and copied to %@ in the background. "
+                   @"If that folder stops answering, the capture goes on.", destFolder]];
     if (play && deck) {
         OVDeck *d = deck;
         dispatch_async(deckQueue, ^{ [d play]; });
@@ -474,8 +506,7 @@ static void append_line(NSString *path, NSString *text)
         OVDeck *d = deck;
         dispatch_async(deckQueue, ^{ [d stop]; });
     }
-    [self log:@"Capture finished."];
-    [self setState:backend ? OVEngineMonitoring : OVEngineIdle];
+    [self finishSession];
 }
 
 - (void)stopRecording
@@ -487,7 +518,142 @@ static void append_line(NSString *path, NSString *text)
     } else if (state == OVEngineRetrying) {
         cancel = YES;
         [self log:@"Stopping retries..."];
+    } else if (state == OVEngineCopying) {
+        cancelCopy = YES;
+        [self log:@"Stopping the copy..."];
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* Local recording, copy to the destination                            */
+
+- (void)setCopyDestination:(NSString *)folder
+{
+    [destFolder release];
+    destFolder = [folder copy];
+}
+
+- (NSString *)resultPath
+{
+    if (!resultFolder || !baseName)
+        return nil;
+    return [resultFolder stringByAppendingPathComponent:
+            [[baseName lastPathComponent] stringByAppendingPathExtension:@"dv"]];
+}
+
+static int copy_cancel_cb(void *ctx, double f)
+{
+    (void)f;
+    return ((OVEngine *)ctx)->cancelCopy ? 1 : 0;
+}
+
+/* waits for one background copy, then compares both files; YES when the
+ * destination holds an identical copy */
+- (BOOL)finishCopy:(dv_mirror *)m from:(NSString *)src to:(NSString *)dst
+{
+    dv_mirror_info mi;
+    double lastLog = now_s();
+    BOOL failing = mirrorFailing;
+    int st, cmp;
+    dv_mirror_complete(m);
+    while ((st = dv_mirror_status(m, &mi)) == DV_MIRROR_RUNNING && !cancelCopy) {
+        BOOL f = mi.failing || mi.seconds_idle > 20;
+        if (f != failing) {
+            failing = f;
+            [self log:f ? [NSString stringWithFormat:@"%@ does not answer: waiting. Click Stop to leave the capture on this Mac.", destFolder]
+                        : [NSString stringWithFormat:@"%@ answers again: the copy continues.", destFolder]];
+        }
+        if (now_s() - lastLog > 60) {
+            lastLog = now_s();
+            [self log:[NSString stringWithFormat:@"  %@: %.0f of %.0f MB copied", [src lastPathComponent],
+                       mi.copied / 1048576.0, mi.source_size / 1048576.0]];
+        }
+        usleep(200000);
+    }
+    mirrorFailing = failing;
+    if (st != DV_MIRROR_DONE)
+        return NO;
+    cmp = dv_files_identical([src fileSystemRepresentation], [dst fileSystemRepresentation], copy_cancel_cb, self);
+    if (cmp == 1)
+        [self log:[NSString stringWithFormat:@"WARNING: the copy of %@ is not identical to the recording.", [src lastPathComponent]]];
+    return cmp == 0;
+}
+
+- (void)copyMain:(id)unused
+{
+    NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *localDir = [baseName stringByDeletingLastPathComponent];
+    NSString *prefix = [[baseName lastPathComponent] stringByAppendingString:@"."];
+    NSString *mainName = [prefix stringByAppendingString:@"dv"], *logName = [prefix stringByAppendingString:@"log"];
+    NSMutableArray *names = [NSMutableArray array], *done = [NSMutableArray array];
+    BOOL ok = YES;
+    dv_mirror *m;
+
+    /* the main file first (its copy is already under way), the log last */
+    [names addObject:mainName];
+    for (NSString *n in [[fm contentsOfDirectoryAtPath:localDir error:NULL] sortedArrayUsingSelector:@selector(compare:)])
+        if ([n hasPrefix:prefix] && ![n isEqualToString:mainName] && ![n isEqualToString:logName])
+            [names addObject:n];
+    [names addObject:logName];
+    [self log:[NSString stringWithFormat:@"Copying the capture to %@ and checking the copy...", destFolder]];
+    pthread_mutex_lock(&mtx);
+    m = mirror;
+    mirror = NULL;
+    pthread_mutex_unlock(&mtx);
+    for (NSString *n in names) {
+        NSString *src = [localDir stringByAppendingPathComponent:n], *dst = [destFolder stringByAppendingPathComponent:n];
+        if (n == logName) {
+            /* everything said so far must be in the file that is copied */
+            [self log:[NSString stringWithFormat:@"The capture files are in %@ and identical to the recording.", destFolder]];
+            dispatch_sync(logQueue, ^{ [logPath release]; logPath = nil; });
+        }
+        if (![fm fileExistsAtPath:src]) {
+            if (n == mainName) ok = NO;
+            dv_mirror_free(m);
+            m = NULL;
+            if (!ok) break;
+            continue;
+        }
+        if (!m)
+            m = dv_mirror_start([src fileSystemRepresentation], [dst fileSystemRepresentation]);
+        ok = m && [self finishCopy:m from:src to:dst];
+        dv_mirror_free(m);
+        m = NULL;
+        if (!ok)
+            break;
+        [done addObject:n];
+    }
+    dv_mirror_free(m);
+    if (ok) {
+        /* the copies are verified: the recordings on this Mac can go */
+        for (NSString *n in done)
+            [fm removeItemAtPath:[localDir stringByAppendingPathComponent:n] error:NULL];
+        [resultFolder release];
+        resultFolder = [destFolder copy];
+        [self setLogPath:[destFolder stringByAppendingPathComponent:logName]];
+        [self log:@"The recording on this Mac was removed after the check."];
+    } else {
+        [self setLogPath:[localDir stringByAppendingPathComponent:logName]];
+        [self log:[NSString stringWithFormat:@"The capture was NOT copied completely to %@ (%@). It is complete and safe on this Mac in %@. "
+                   @"Copy the files named %@* from there when the folder works again.",
+                   destFolder, cancelCopy ? @"stopped" : @"the folder failed", localDir, prefix]];
+    }
+    [self log:@"Capture finished."];
+    [self setState:backend ? OVEngineMonitoring : OVEngineIdle];
+    [pool release];
+}
+
+/* end of a capture session (any thread) */
+- (void)finishSession
+{
+    if (destFolder && baseName) {
+        [self setState:OVEngineCopying];
+        [NSThread detachNewThreadSelector:@selector(copyMain:) toTarget:self withObject:nil];
+        return;
+    }
+    [self log:@"Capture finished."];
+    [self setState:backend ? OVEngineMonitoring : OVEngineIdle];
 }
 
 /* Seconds without a picture after which a capture ends although the deck
@@ -524,10 +690,17 @@ static void append_line(NSString *path, NSString *text)
             blankLogged = NO;
             [self log:[NSString stringWithFormat:@"Picture is back at frame %u.", s.framesRecorded]];
         }
+        if (s.copying && (BOOL)s.copyFailing != mirrorFailing) {
+            mirrorFailing = (BOOL)s.copyFailing;
+            [self log:mirrorFailing
+                ? [NSString stringWithFormat:@"%@ does not answer. The capture goes on, on this Mac; the copy continues when the folder is back.", destFolder]
+                : [NSString stringWithFormat:@"%@ answers again: the copy continues.", destFolder]];
+        }
         if (t - lastProgressLog > 300) {
             lastProgressLog = t;
-            [self log:[NSString stringWithFormat:@"Progress: %u frames, %u with issues, %.1f MB waiting to be written, deck %@",
+            [self log:[NSString stringWithFormat:@"Progress: %u frames, %u with issues, %.1f MB waiting to be written%@, deck %@",
                        s.framesRecorded, s.framesWithErrors, s.bufferedBytes / 1048576.0,
+                       s.copying ? [NSString stringWithFormat:@", %.1f MB not yet copied", s.copyBehind / 1048576.0] : @"",
                        deck ? [OVDeck describeState:(OVDeckState)deckStateCache] : @"not controlled"]];
         }
         if (writeError) {
@@ -770,8 +943,7 @@ static void append_line(NSString *path, NSString *text)
     }
     if (autoStopDeck && deck)
         [deck stop];
-    [self log:@"Capture finished."];
-    [self setState:backend ? OVEngineMonitoring : OVEngineIdle];
+    [self finishSession];
     [pool release];
 }
 

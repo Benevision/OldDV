@@ -27,7 +27,7 @@ and DVRescue's Qt player/GUI.
 
 ### Option A: prebuilt app
 
-1. Copy `dist/OldDV-Rescue-1.0.2-mac.zip` to the Mac and double-click it.
+1. Copy `dist/OldDV-Rescue-1.1.0-mac.zip` to the Mac and double-click it.
 2. Drag **OldDV Rescue.app** to *Applications*.
 3. On 10.6 it just opens. On 10.8+ Gatekeeper may say the app is from an unidentified
    developer: right-click (Ctrl-click) the app, choose **Open**, then confirm once.
@@ -220,14 +220,26 @@ Yes*. Then use *Go → Connect to Server* with `smb://tower.local/YourShare`. It
 SMB1 is slow and insecure, so use it only on your home network. Newer Unraid versions may
 no longer offer this option; use NFS then.
 
-**3. Capture locally, then copy.** Capture to the internal disk (the safest for an
-irreplaceable tape) and copy the files to the share afterwards over NFS or SMB1.
+**What OldDV Rescue does to make network capture safe.** When the folder you chose is on a
+network share, the capture is recorded on the internal disk first, in
+`~/Movies/OldDV Rescue Cache`, and copied to the share in the background while the tape
+plays. A share that stalls or disconnects can't hurt the capture:
 
-**What OldDV Rescue does to make network capture safe.** The capture data goes into a
-256 MB memory buffer (about 70 seconds of DV), and a separate thread writes it to the
-destination. A share that pauses for a few seconds doesn't cost any frames. The Capture
-tab shows *Buffered: …* when the network falls behind. If it ever falls more than
-70 seconds behind, it shows *DROPPED*, and the log says how many frames were lost.
+- The Capture tab shows *To copy: …*, the amount not yet on the share. It shows
+  *SHARE DOWN, safe here: …* while the share doesn't answer. The copy continues by itself
+  when the share is back.
+- When the capture ends, the rest is copied and every file is compared with the recording.
+  Only then is the recording on the Mac removed. The button reads *Stop Copy* during this
+  step; a 60 minute tape takes a few minutes to compare.
+- If the share is still gone, or you stop the copy, the capture stays in the cache folder
+  and the log says so. The app lists such captures when it starts. Copy them by hand, or
+  with `olddv name.dv --copy-to /Volumes/Share/name.dv` (waits for the share, retries, and
+  compares).
+- The Mac needs 15 GB free. With less, the app asks whether to record straight to the
+  share. Then only a 256 MB memory buffer (about 70 seconds) protects the capture, and the
+  rest of the tape is lost if the share stays away longer.
+
+Folders on internal, USB and FireWire disks are recorded to directly, as before.
 
 Wired gigabit Ethernet is plenty, since DV needs only 3.6 MB/s. Wi-Fi works but is less
 reliable.

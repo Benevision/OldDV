@@ -23,7 +23,7 @@
 extern "C" {
 #endif
 
-#define OLDDV_VERSION "1.0.2"
+#define OLDDV_VERSION "1.1.0"
 
 #define DV_BLOCK_SIZE   80
 #define DV_DSEQ_SIZE    12000          /* 150 blocks of 80 bytes */
@@ -251,6 +251,27 @@ size_t dv_writer_peak(dv_writer *w);     /* highest buffer use */
 int    dv_writer_error(dv_writer *w);    /* 0 ok, 1 write error, 2 data dropped */
 uint64_t dv_writer_dropped(dv_writer *w);
 int    dv_writer_close(dv_writer *w);    /* flush and close: 0 ok, 1 data was dropped, -1 error */
+
+/* --------------------------------------------------------------------- */
+/* Background copy of a growing file (capture on the local disk, copy on  */
+/* a network share that may stall or disappear)                           */
+
+enum { DV_MIRROR_RUNNING = 0, DV_MIRROR_DONE = 1, DV_MIRROR_FAILED = -1, DV_MIRROR_CANCELLED = -2 };
+typedef struct dv_mirror dv_mirror;
+typedef struct dv_mirror_info {
+    int64_t copied;        /* bytes safely handed to the destination */
+    int64_t source_size;
+    int     failures;      /* times the destination failed so far */
+    int     failing;       /* 1: the destination does not answer right now */
+    double  seconds_idle;  /* without progress although data is waiting */
+} dv_mirror_info;
+/* starts copying src to dst; src may not exist yet and may keep growing */
+dv_mirror *dv_mirror_start(const char *src, const char *dst);
+void dv_mirror_complete(dv_mirror *m);  /* src is final: finish and stop */
+int  dv_mirror_status(dv_mirror *m, dv_mirror_info *info); /* DV_MIRROR_... */
+void dv_mirror_free(dv_mirror *m);      /* cancels a running copy; never blocks */
+/* 0 identical, 1 different, -1 cannot read, 2 cancelled by progress() */
+int  dv_files_identical(const char *a, const char *b, dv_progress_cb progress, void *ctx);
 
 /* --------------------------------------------------------------------- */
 /* Audio extraction and lossless QuickTime (.mov) rewrap                  */

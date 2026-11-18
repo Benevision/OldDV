@@ -97,4 +97,15 @@ a3=$(ffmpeg -v error -i "$W/audbad.dv" -map 0:a:0 -f s16le - | md5sum)
 a4=$(tail -c +45 "$W/silent.wav" | md5sum)
 check "without repair the audio is ffmpeg's decode" "[ \"$a3\" = \"$a4\" ]"
 
+# background copy: the source is still growing and the destination folder
+# does not exist at first (a share that is not there yet)
+( : > "$W/grow.dv"
+  for i in 0 1 2 3 4 5; do dd if="$W/clean.dv" bs=3000000 skip=$i count=1 2>/dev/null >> "$W/grow.dv"; sleep 0.3; done
+  tail -c +18000001 "$W/clean.dv" >> "$W/grow.dv"; touch "$W/grow.done" ) &
+( sleep 1; mkdir -p "$W/share" ) &
+"$OLDDV" "$W/grow.dv" --copy-to "$W/share/grow.dv" --copy-until "$W/grow.done" > "$W/copy.txt" 2>&1 || true
+wait
+check "copy of a growing file to a late destination is complete" "cmp -s $W/clean.dv $W/share/grow.dv"
+check "copy reports the interruption" "grep -q 'verified: 21480000 bytes, 1 interruption' $W/copy.txt"
+
 [ $fail = 0 ] && echo "All tests passed." || { echo "Some tests failed."; exit 1; }

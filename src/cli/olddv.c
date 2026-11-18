@@ -11,6 +11,7 @@
 #include "../core/dvcore.h"
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static void usage(void)
 {
@@ -29,6 +30,8 @@ static void usage(void)
         "                          audio error codes are repaired by interpolation\n"
         "      --wav FILE          write the (repaired) audio as a .wav file\n"
         "      --no-audio-repair   keep unreadable audio samples as silence\n"
+           "      --copy-to FILE      copy the input to FILE, waiting and retrying when\n"
+           "                          the destination (network share) fails, then compare\n"
         "      --by LIST           split criteria: rec,format,tc (default rec,format)\n"
         "      --min N             minimum part length in frames (default 1)\n"
         "  -p, --progress          show progress on stderr\n"
@@ -62,6 +65,7 @@ int main(int argc, char **argv)
     const char *inputs[64];
     int ninputs = 0, i, ret = 0;
     const char *wav_out = NULL; int export_flags = 0;
+    const char *copy_to = NULL, *copy_until = NULL;
     const char *mov_out = NULL, *xml_out = NULL, *merge_out = NULL, *merge_log = NULL, *split_base = NULL;
     int summary = 0, csv = 0, split_flags = DV_SPLIT_REC_START | DV_SPLIT_FORMAT;
     unsigned min_frames = 1;
@@ -76,6 +80,8 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--split") && i + 1 < argc) split_base = argv[++i];
         else if (!strcmp(a, "--mov") && i + 1 < argc) mov_out = argv[++i];
         else if (!strcmp(a, "--wav") && i + 1 < argc) wav_out = argv[++i];
+        else if (!strcmp(a, "--copy-to") && i + 1 < argc) copy_to = argv[++i];
+        else if (!strcmp(a, "--copy-until") && i + 1 < argc) copy_until = argv[++i];
         else if (!strcmp(a, "--no-audio-repair")) export_flags |= DV_EXPORT_NO_CONCEAL;
         else if (!strcmp(a, "--by") && i + 1 < argc) {
             const char *v = argv[++i];
@@ -93,6 +99,38 @@ int main(int argc, char **argv)
         else if (ninputs < 64) inputs[ninputs++] = a;
     }
     if (!ninputs) { usage(); return 1; }
+
+    if (copy_to) {
+        /* copy with retries, then compare: the same code that moves a
+         * capture from the local disk to a network share. With
+         * --copy-until MARKER the input is still growing until the file
+         * MARKER exists. */
+        dv_mirror *m = dv_mirror_start(inputs[0], copy_to);
+        dv_mirror_info mi;
+        int st, told = 0, failing = 0;
+        if (!m) { fprintf(stderr, "Cannot start the copy\n"); return 1; }
+        if (!copy_until)
+            dv_mirror_complete(m);
+        while ((st = dv_mirror_status(m, &mi)) == DV_MIRROR_RUNNING) {
+            if (copy_until && !told && !access(copy_until, F_OK)) {
+                dv_mirror_complete(m);
+                told = 1;
+            }
+            if (mi.failing != failing) {
+                failing = mi.failing;
+                fprintf(stderr, failing ? "Destination does not answer, trying again...\n" : "Destination is back.\n");
+            }
+            usleep(100000);
+        }
+        dv_mirror_free(m);
+        if (st != DV_MIRROR_DONE) { fprintf(stderr, "Copy failed\n"); return 1; }
+        if (dv_files_identical(inputs[0], copy_to, quiet ? NULL : progress_cb, NULL)) {
+            fprintf(stderr, "The copy is NOT identical to %s\n", inputs[0]);
+            return 1;
+        }
+        printf("Copied and verified: %lld bytes, %d interruption(s)\n", (long long)mi.copied, mi.failures);
+        return 0;
+    }
 
     if (merge_out) {
         dv_merge_stats st;
