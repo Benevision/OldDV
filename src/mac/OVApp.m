@@ -6,7 +6,7 @@
  * Xcode 3.2.6 and runs on 10.6 - 10.14.
  */
 #import <Cocoa/Cocoa.h>
-#import <QTKit/QTKit.h>
+#import "OVMovie.h"
 #import "OVEngine.h"
 #import "OVViews.h"
 #import "OVPlayer.h"
@@ -175,7 +175,7 @@ static NSString *fmtDuration(uint64_t frames, int pal)
 
     /* capture tab */
     OVBlackView *previewBox;
-    NSPopUpButton *devicePopup, *enginePopup, *retryPopup;
+    NSPopUpButton *devicePopup, *enginePopup, *retryPopup, *mergePopup;
     NSArray *deviceList;
     NSTextField *connLabel, *folderField, *nameField, *timeoutField, *deckLabel, *statsLabel, *statsLabel2;
     NSButton *autoPlayCheck, *previewCheck, *captureButton, *connectButton;
@@ -198,7 +198,7 @@ static NSString *fmtDuration(uint64_t frames, int pal)
     uint32_t *rows;
     uint32_t nrows;
     NSString *analysisFile;
-    QTMovie *movie;
+    OVMovie *movie;
     OVPlayer *player;
     BOOL busy;
 
@@ -209,6 +209,7 @@ static NSString *fmtDuration(uint64_t frames, int pal)
     NSProgressIndicator *mergeProgress;
     NSTextView *mergeLog;
     NSButton *mergeButton;
+    NSString *pendingOpen;  /* a .olddv file opened before the window exists */
 
     /* package tab */
     NSTextField *packInField, *packOutField, *packMinField, *ffmpegField;
@@ -308,7 +309,9 @@ static void log_to_main(void *ctx, const char *line)
     retryPopup = mkPopup(v, NSMakeRect(x + 195, y - 4, 80, 26),
                          [NSArray arrayWithObjects:@"Off", @"1 time", @"2 times", @"3 times", @"5 times", nil]);
     [retryPopup selectItemAtIndex:[defs integerForKey:@"retries"]];
-    mkLabel(v, NSMakeRect(x + 280, y, 260, 18), @"(rewinds the deck, then merges)");
+    mergePopup = mkPopup(v, NSMakeRect(x + 280, y - 4, 228, 26),
+                         [NSArray arrayWithObjects:@"then merge on this Mac", @"merge later, on any Mac", nil]);
+    [mergePopup selectItemAtIndex:[defs boolForKey:@"merge_later"] ? 1 : 0];
     y -= 26;
     previewCheck = mkCheck(v, NSMakeRect(x, y, 160, 20), @"Live picture preview", ![defs boolForKey:@"nopreview"]);
     [previewCheck setTarget:self];
@@ -509,6 +512,8 @@ static BOOL OVFolderIsRemote(NSString *folder)
     [defs setObject:[timeoutField stringValue] forKey:@"timeout"];
     [defs setInteger:[retryPopup indexOfSelectedItem] forKey:@"retries"];
     [defs setBool:[autoPlayCheck state] == NSOnState forKey:@"autoplay"];
+    [defs setBool:[mergePopup indexOfSelectedItem] == 1 forKey:@"merge_later"];
+    [engine setMergeLater:[mergePopup indexOfSelectedItem] == 1];
     /* A folder on a network share: record on this Mac and copy in the
      * background, so that a share that stalls or drops cannot hurt the
      * capture. */
@@ -903,9 +908,9 @@ static BOOL OVFolderIsRemote(NSString *folder)
     if (fp)
         fclose(fp);
     if (!movie)
-        movie = [[QTMovie movieWithFile:analysisFile error:NULL] retain];
+        movie = [[OVMovie movieWithFile:analysisFile] retain];
     if (movie) {
-        NSImage *img = [movie frameImageAtTime:QTMakeTimeWithTimeInterval(f->pts_ns / 1e9 + 0.001)];
+        NSImage *img = [movie imageAtTime:f->pts_ns / 1e9 + 0.001];
         [thumb setImage:img];
     }
 }
@@ -995,6 +1000,8 @@ static BOOL OVFolderIsRemote(NSString *folder)
                          [NSArray arrayWithObject:@"Takes (first = reference)"], [NSArray arrayWithObject:@"700"], self);
     mkButton(v, NSMakeRect(W - 144, H - 92, 130, 32), @"Add Takes...", self, @selector(mergeAdd:));
     mkButton(v, NSMakeRect(W - 144, H - 124, 130, 32), @"Remove", self, @selector(mergeRemove:));
+    mkButton(v, NSMakeRect(W - 144, H - 172, 130, 32), @"Open Capture...", self, @selector(mergeOpenCapture:));
+    mkLabel(v, NSMakeRect(W - 140, H - 250, 126, 76), @"A capture whose re-reads were not merged: choose its .olddv or .dv file.");
     mkLabel(v, NSMakeRect(12, H - 284, 90, 18), @"Output file:");
     mergeOutField = mkField(v, NSMakeRect(100, H - 286, W - 260, 22), @"");
     mkButton(v, NSMakeRect(W - 154, H - 292, 140, 32), @"Choose...", self, @selector(mergeChooseOut:));
@@ -1017,6 +1024,60 @@ static BOOL OVFolderIsRemote(NSString *folder)
         if (![[mergeOutField stringValue] length] && [mergeInputs count])
             [mergeOutField setStringValue:[[[mergeInputs objectAtIndex:0] stringByDeletingPathExtension] stringByAppendingString:@".merged.dv"]];
     }
+}
+
+/* The takes of a capture that was left unmerged ("merge later"), made on
+ * this Mac or another one. path: NAME.olddv or any file of the capture. */
+- (BOOL)loadCapture:(NSString *)path
+{
+    dv_capture_set set;
+    int i;
+    [tabs selectTabViewItemAtIndex:2];
+    if (busy) { NSBeep(); return NO; }
+    if (dv_capture_open([path fileSystemRepresentation], &set)) {
+        NSRunAlertPanel(@"Open Capture", @"No capture found for %@. The first pass (NAME.dv) must be in the same folder.", @"OK", nil, nil,
+                        [path lastPathComponent]);
+        return NO;
+    }
+    [mergeInputs removeAllObjects];
+    for (i = 0; i < set.ntakes; i++)
+        [mergeInputs addObject:[[NSFileManager defaultManager] stringWithFileSystemRepresentation:set.takes[i] length:strlen(set.takes[i])]];
+    [mergeTable reloadData];
+    [mergeOutField setStringValue:[[NSFileManager defaultManager] stringWithFileSystemRepresentation:set.merged length:strlen(set.merged)]];
+    appendText(mergeLog, [NSString stringWithFormat:@"Capture %@: %d take(s).", [[mergeInputs objectAtIndex:0] lastPathComponent], set.ntakes]);
+    if (set.missing)
+        appendText(mergeLog, [NSString stringWithFormat:@"WARNING: %d take(s) named in the list are not in the folder. Copy them next to "
+                              @"the others, then open the capture again.", set.missing]);
+    if (set.ntakes < 2)
+        appendText(mergeLog, @"Only the first pass is there: no re-read to merge. The capture is complete as it is.");
+    else if (set.merged_exists)
+        appendText(mergeLog, [NSString stringWithFormat:@"%@ already exists: this capture seems to be merged. Choose another output file "
+                              @"to merge again.", [[mergeOutField stringValue] lastPathComponent]]);
+    else
+        appendText(mergeLog, @"Click Merge. The takes are only read; the result is a new file next to them.");
+    dv_capture_free(&set);
+    return YES;
+}
+
+- (void)mergeOpenCapture:(id)s
+{
+    NSOpenPanel *p = [NSOpenPanel openPanel];
+    [p setAllowedFileTypes:[NSArray arrayWithObjects:@"olddv", @"dv", nil]];
+    [p setMessage:@"Choose the .olddv file of the capture (or its first pass, NAME.dv)"];
+    if ([p runModal] == NSFileHandlingPanelOKButton)
+        [self loadCapture:[[p URL] path]];
+}
+
+- (BOOL)application:(NSApplication *)a openFile:(NSString *)file
+{
+    if ([[[file pathExtension] lowercaseString] isEqualToString:@"olddv"]) {
+        if (!tabs)
+            pendingOpen = [file copy];
+        else
+            [self loadCapture:file];
+        return YES;
+    }
+    return NO;
 }
 
 - (void)mergeRemove:(id)s
@@ -1049,6 +1110,11 @@ static BOOL OVFolderIsRemote(NSString *folder)
         NSRunAlertPanel(@"Merge", @"Choose an output file that is not one of the takes.", @"OK", nil, nil);
         return;
     }
+    if ([[NSFileManager defaultManager] fileExistsAtPath:out]) {
+        NSRunAlertPanel(@"Merge", @"%@ already exists. Choose another output file, or move that one away.", @"OK", nil, nil,
+                        [out lastPathComponent]);
+        return;
+    }
     busy = YES;
     [mergeButton setEnabled:NO];
     [mergeProgress setDoubleValue:0];
@@ -1072,11 +1138,22 @@ static BOOL OVFolderIsRemote(NSString *folder)
         dv_analyze_file([out fileSystemRepresentation], &r, NULL, NULL);
         dv_report_save_xml([[out stringByAppendingString:@".dvrescue.xml"] fileSystemRepresentation], &r);
         dv_report_free(&r);
-        log_to_main(self, "Merged file and its XML report written.");
+        log_to_main(self, "Merged file and its XML report written. It is now the input of the Package & Export tab.");
+        [self performSelectorOnMainThread:@selector(mergeMade:) withObject:out waitUntilDone:NO];
     } else
         log_to_main(self, "Merge failed.");
     [self performSelectorOnMainThread:@selector(jobDone:) withObject:nil waitUntilDone:NO];
     [pool release];
+}
+
+- (void)mergeMade:(NSString *)out
+{
+    [packInField setStringValue:out];
+#ifdef OV_TEST_AUTOMERGE
+    busy = NO;
+    [tabs selectTabViewItemAtIndex:1];
+    [self analyzeFile:out];
+#endif
 }
 
 - (void)jobDone:(id)x
@@ -1540,13 +1617,28 @@ static BOOL OVFolderIsRemote(NSString *folder)
                             [OVCaptureBackend qtKitAvailable] ? @"QTKit " : @"",
                             [OVCaptureBackend avFoundationAvailable] ? @"AVFoundation" : @""]);
     [self reportCacheLeftovers];
-    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(deviceNotification:) name:QTCaptureDeviceWasConnectedNotification object:nil];
-    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(deviceNotification:) name:QTCaptureDeviceWasDisconnectedNotification object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(deviceNotification:) name:@"QTCaptureDeviceWasConnectedNotification" object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(deviceNotification:) name:@"QTCaptureDeviceWasDisconnectedNotification" object:nil];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(deviceNotification:) name:@"AVCaptureDeviceWasConnectedNotification" object:nil];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(deviceNotification:) name:@"AVCaptureDeviceWasDisconnectedNotification" object:nil];
     [self refreshDevices:self];
     if ([deviceList count])
         [self connect:nil];
+#ifdef OLDDV_MODERN
+    if (![deviceList count]) {
+        appendText(captureLog, @"No FireWire DV device on this Mac (macOS 26 and later cannot use FireWire at all). Analyze, Merge Takes "
+                               @"and Package & Export work: a capture made on an older Mac can be finished here.");
+        [tabs selectTabViewItemAtIndex:2];
+    }
+#endif
+    if (pendingOpen) {
+        [self loadCapture:pendingOpen];
+        [pendingOpen release];
+        pendingOpen = nil;
+#ifdef OV_TEST_AUTOMERGE /* test builds: merge without a click, then analyze the result */
+        [self mergeRun:nil];
+#endif
+    }
     timer = [[NSTimer scheduledTimerWithTimeInterval:0.25 target:self selector:@selector(tick:) userInfo:nil repeats:YES] retain];
     [[NSRunLoop currentRunLoop] addTimer:timer forMode:NSModalPanelRunLoopMode];
     [[NSRunLoop currentRunLoop] addTimer:timer forMode:NSEventTrackingRunLoopMode];

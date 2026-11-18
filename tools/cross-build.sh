@@ -21,7 +21,7 @@ for f in src/core/*.c; do
   $CC $CFLAGS -std=gnu99 -c "$f" -o "$OUT/obj/$(basename "$f" .c).o"
 done
 $CC $CFLAGS -c tools/crt_start_10_6.c -o "$OUT/obj/crt.o"
-for f in OVApp OVCapture OVDeck OVEngine OVViews OVPlayer; do
+for f in OVApp OVCapture OVDeck OVEngine OVViews OVPlayer OVMovie; do
   $CC $CFLAGS -std=gnu99 -fobjc-exceptions -c "src/mac/$f.m" -o "$OUT/obj/$f.o"
 done
 
@@ -38,7 +38,7 @@ else
 fi
 
 LDFLAGS="$TARGET -isysroot $SDK106 -fuse-ld=lld -nostartfiles -Wl,-e,start -Wl,-headerpad,0x2000"
-$CC $LDFLAGS "$OUT/obj/crt.o" "$OUT/obj/OVApp.o" "$OUT/obj/OVCapture.o" "$OUT/obj/OVDeck.o" "$OUT/obj/OVEngine.o" "$OUT/obj/OVViews.o" "$OUT/obj/OVPlayer.o" "$OUT"/obj/dv*.o $AVF_LINK \
+$CC $LDFLAGS "$OUT/obj/crt.o" "$OUT/obj/OVApp.o" "$OUT/obj/OVCapture.o" "$OUT/obj/OVDeck.o" "$OUT/obj/OVEngine.o" "$OUT/obj/OVViews.o" "$OUT/obj/OVPlayer.o" "$OUT/obj/OVMovie.o" "$OUT"/obj/dv*.o $AVF_LINK \
     -framework Cocoa -framework QTKit -framework IOKit -framework QuartzCore \
     -o "$APP/Contents/MacOS/OldDV Rescue"
 $CC $CFLAGS -std=gnu99 -c src/cli/olddv.c -o "$OUT/obj/olddv_cli.o"

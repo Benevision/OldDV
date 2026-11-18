@@ -6,6 +6,7 @@
  *   olddv FILE.dv -s                       human readable summary
  *   olddv FILE.dv --csv                    frames with issues as CSV
  *   olddv A.dv B.dv C.dv -m merged.dv      merge captures of one tape
+ *   olddv --finish NAME.olddv              merge a capture and its re-reads
  *   olddv FILE.dv --split base [--by rec,format,tc] [--min N]
  */
 #include "../core/dvcore.h"
@@ -24,6 +25,9 @@ static void usage(void)
         "  -m, --merge FILE        merge all inputs (same tape) into FILE,\n"
         "                          picking the best blocks of each input\n"
         "      --merge-log FILE    write the merge log to FILE\n"
+        "      --finish            the input is a capture whose re-read passes were\n"
+        "                          not merged (NAME.olddv or NAME.dv): merge them into\n"
+        "                          NAME.merged.dv and write its report\n"
         "      --split BASE        split the input into BASE_partNNN.dv\n"
         "      --mov FILE          rewrap the input into a QuickTime .mov\n"
         "                          (DV video untouched + PCM audio, lossless)\n"
@@ -73,6 +77,7 @@ int main(int argc, char **argv)
     const char *cc_out[3] = { NULL, NULL, NULL }; int cc_field = 1;
     const char *copy_to = NULL, *copy_until = NULL;
     const char *mov_out = NULL, *xml_out = NULL, *merge_out = NULL, *merge_log = NULL, *split_base = NULL;
+    int finish = 0;
     int summary = 0, csv = 0, split_flags = DV_SPLIT_REC_START | DV_SPLIT_FORMAT;
     unsigned min_frames = 1;
 
@@ -83,6 +88,7 @@ int main(int argc, char **argv)
         else if ((!strcmp(a, "-x") || !strcmp(a, "--xml-output")) && i + 1 < argc) xml_out = argv[++i];
         else if ((!strcmp(a, "-m") || !strcmp(a, "--merge")) && i + 1 < argc) merge_out = argv[++i];
         else if (!strcmp(a, "--merge-log") && i + 1 < argc) merge_log = argv[++i];
+        else if (!strcmp(a, "--finish")) finish = 1;
         else if (!strcmp(a, "--split") && i + 1 < argc) split_base = argv[++i];
         else if (!strcmp(a, "--mov") && i + 1 < argc) mov_out = argv[++i];
         else if (!strcmp(a, "--wav") && i + 1 < argc) wav_out = argv[++i];
@@ -140,6 +146,52 @@ int main(int argc, char **argv)
             return 1;
         }
         printf("Copied and verified: %lld bytes, %d interruption(s)\n", (long long)mi.copied, mi.failures);
+        return 0;
+    }
+
+    if (finish) {
+        dv_capture_set set;
+        dv_merge_stats st;
+        dv_report r;
+        char *xml;
+        if (dv_capture_open(inputs[0], &set)) {
+            fprintf(stderr, "%s: no capture found (the first pass NAME.dv must be next to it)\n", inputs[0]);
+            return 1;
+        }
+        for (i = 0; i < set.ntakes; i++)
+            fprintf(stderr, "Take %d: %s\n", i + 1, set.takes[i]);
+        if (set.missing)
+            fprintf(stderr, "WARNING: %d take(s) of the list are missing\n", set.missing);
+        if (set.ntakes < 2) {
+            fprintf(stderr, "Only the first pass is there: nothing to merge.\n");
+            dv_capture_free(&set);
+            return 2;
+        }
+        if (set.merged_exists) {
+            fprintf(stderr, "%s already exists: move it away first.\n", set.merged);
+            dv_capture_free(&set);
+            return 1;
+        }
+        if (merge_log)
+            merge_log_fp = fopen(merge_log, "w");
+        if (dv_merge_files((const char **)set.takes, set.ntakes, set.merged, &st, log_cb, quiet ? NULL : progress_cb, NULL)) {
+            fprintf(stderr, "Merge failed\n");
+            dv_capture_free(&set);
+            return 1;
+        }
+        dv_report_init(&r, set.merged);
+        dv_analyze_file(set.merged, &r, NULL, NULL);
+        xml = (char *)malloc(strlen(set.merged) + 16);
+        if (xml) {
+            sprintf(xml, "%s.dvrescue.xml", set.merged);
+            dv_report_save_xml(xml, &r);
+            free(xml);
+        }
+        if (summary)
+            dv_report_write_summary(stdout, &r);
+        printf("%s\n", set.merged);
+        dv_report_free(&r);
+        dv_capture_free(&set);
         return 0;
     }
 

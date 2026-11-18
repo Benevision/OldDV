@@ -23,7 +23,7 @@
 extern "C" {
 #endif
 
-#define OLDDV_VERSION "1.3.0"
+#define OLDDV_VERSION "1.4.0"
 
 #define DV_BLOCK_SIZE   80
 #define DV_DSEQ_SIZE    12000          /* 150 blocks of 80 bytes */
@@ -223,6 +223,28 @@ typedef void (*dv_log_cb)(void *ctx, const char *line);
 
 int dv_merge_files(const char **inputs, int n, const char *output,
                    dv_merge_stats *stats, dv_log_cb log, dv_progress_cb progress, void *ctx);
+
+/* --------------------------------------------------------------------- */
+/* The files of one capture (first pass + re-read passes), so that the    */
+/* merge can be done later and on another machine                         */
+
+typedef struct dv_capture_set {
+    char  *base;          /* path without ".dv" */
+    char **takes;         /* first pass, then the re-read passes that exist */
+    int    ntakes;
+    int    missing;       /* takes named in the list that are not there */
+    char  *merged;        /* base.merged.dv */
+    int    merged_exists;
+    char  *list;          /* base.olddv */
+    int    has_list;
+} dv_capture_set;
+
+/* path: the .olddv list or any file of the capture (NAME.dv,
+ * NAME.retry1.dv, NAME.log...). 0 ok, -1 when the first pass is missing. */
+int  dv_capture_open(const char *path, dv_capture_set *set);
+void dv_capture_free(dv_capture_set *set);
+/* writes base.olddv: the takes still to be merged */
+int  dv_capture_write_list(const char *base, const char **takes, int n);
 
 /* --------------------------------------------------------------------- */
 /* Packager: split a DV file in parts                                     */

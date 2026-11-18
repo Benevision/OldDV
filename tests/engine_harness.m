@@ -114,6 +114,10 @@ static int sim_main(char **argv)
         tape[i] = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:argv[2 + i]] options:NSDataReadingMapped error:NULL];
     simLen = (long)([tape[0] length] / 120000);
     if (![e connectDevice:@"x" engine:OVEngineAutomatic preview:nil error:&err]) { printf("connect: %s\n", [err UTF8String]); return 1; }
+    if (getenv("OV_MERGE_LATER")) /* leave the takes unmerged */
+        [e setMergeLater:YES];
+    if (getenv("OV_COPY_TO"))     /* record in LOCALDIR, copy to this folder */
+        [e setCopyDestination:[NSString stringWithUTF8String:getenv("OV_COPY_TO")]];
     if (![e startRecordingTo:base retries:3 noDataTimeout:2 playDeck:YES error:&err]) { printf("start: %s\n", [err UTF8String]); return 1; }
     for (;;) {
         OVEngineState st = [e state];
@@ -142,6 +146,8 @@ static int sim_main(char **argv)
         if (++it % 12 == 0)
             snapshot(e, g, snapDir, snap++);
     }
+    while ([e state] == OVEngineCopying) /* the copy to OV_COPY_TO */
+        spin(0.1);
     snapshot(e, g, snapDir, snap);
     /* the same with the mouse over it */
     [g setValue:[NSNumber numberWithDouble:222] forKey:@"hoverX"];

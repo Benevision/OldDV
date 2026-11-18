@@ -491,8 +491,9 @@ static void append_line(NSString *path, NSString *text)
     [self log:[NSString stringWithFormat:@"OldDV Rescue %s on %@, capture engine: %@, deck control: %@",
                OLDDV_VERSION, [[NSProcessInfo processInfo] operatingSystemVersionString], [self engineName],
                deck ? [deck name] : @"none"]];
-    [self log:[NSString stringWithFormat:@"Recording to %@ (finish after %.0f s without signal, %d retry pass(es), %@)",
-               path, noDataTimeout, retryCount, play ? @"deck started by the app" : @"deck not started by the app"]];
+    [self log:[NSString stringWithFormat:@"Recording to %@ (finish after %.0f s without signal, %d retry pass(es)%@, %@)",
+               path, noDataTimeout, retryCount, retryCount && mergeLater ? @" merged later" : @"",
+               play ? @"deck started by the app" : @"deck not started by the app"]];
     if (destFolder)
         [self log:[NSString stringWithFormat:@"The capture is recorded on this Mac and copied to %@ in the background. "
                    @"If that folder stops answering, the capture goes on.", destFolder]];
@@ -572,6 +573,8 @@ static void append_line(NSString *path, NSString *text)
     [destFolder release];
     destFolder = [folder copy];
 }
+
+- (void)setMergeLater:(BOOL)later { mergeLater = later; }
 
 - (NSString *)resultPath
 {
@@ -1093,7 +1096,20 @@ static int copy_cancel_cb(void *ctx, double f)
         graphRev++;
     }
     pthread_mutex_unlock(&mtx);
-    if ([takes count] > 1) {
+    if ([takes count] > 1 && mergeLater) {
+        const char *in[64];
+        int n = 0;
+        for (NSString *t in takes)
+            if (n < 64)
+                in[n++] = [t fileSystemRepresentation];
+        if (dv_capture_write_list([baseName fileSystemRepresentation], in, n) == 0)
+            [self log:[NSString stringWithFormat:@"The %d takes are NOT merged yet, as chosen. To merge them, on this Mac or another one: "
+                       @"Merge Takes > Open Capture... and choose %@.olddv (it lists the takes; keep all the files together).",
+                       n, [baseName lastPathComponent]]];
+        else
+            [self log:[NSString stringWithFormat:@"The %d takes are not merged, and the list %@.olddv could not be written. "
+                       @"Merge Takes > Open Capture... also accepts %@.dv.", n, [baseName lastPathComponent], [baseName lastPathComponent]]];
+    } else if ([takes count] > 1) {
         NSString *merged = [baseName stringByAppendingString:@".merged.dv"];
         const char *in[64];
         int n = 0;

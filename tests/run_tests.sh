@@ -84,6 +84,25 @@ head -c 12050000 "$W/take2.dv" > "$W/cut.dv"
 "$OLDDV" "$W/take1.dv" "$W/cut.dv" -m "$W/cut_m.dv" > /dev/null 2>&1
 check "merge ignores the incomplete last frame of a cut-off take" "[ \$(( \$(wc -c < $W/cut_m.dv) % 120000 )) -eq 0 ]"
 
+# a capture left unmerged ("merge later"): found from its list or from any
+# of its files, merged by --finish; the takes are not touched
+mkdir "$W/cap"
+cp "$W/take1.dv" "$W/cap/T.dv"; cp "$W/take2.dv" "$W/cap/T.retry1.dv"; cp "$W/take3.dv" "$W/cap/T.retry3.dv"
+: > "$W/cap/T.retry2.dv"
+printf 'OldDV Rescue capture\nversion=1\ntake=T.dv\ntake=T.retry1.dv\ntake=T.retry3.dv\noutput=T.merged.dv\n' > "$W/cap/T.olddv"
+sum1=$(cat "$W/cap/T.dv" "$W/cap/T.retry1.dv" "$W/cap/T.retry3.dv" | md5sum)
+"$OLDDV" --finish "$W/cap/T.olddv" > "$W/fin.txt" 2>/dev/null
+check "finish: capture merged from its list, same result as a merge of the takes" "cmp -s $W/merged.dv $W/cap/T.merged.dv && [ -s $W/cap/T.merged.dv.dvrescue.xml ]"
+check "finish: takes untouched" "[ \"$sum1\" = \"\$(cat $W/cap/T.dv $W/cap/T.retry1.dv $W/cap/T.retry3.dv | md5sum)\" ]"
+if "$OLDDV" --finish "$W/cap/T.retry1.dv" >/dev/null 2>&1; then again=0; else again=1; fi
+check "finish: an existing merged file is not overwritten" "[ $again = 1 ] && cmp -s $W/merged.dv $W/cap/T.merged.dv"
+rm "$W/cap/T.olddv" "$W/cap/T.merged.dv"
+"$OLDDV" --finish "$W/cap/T.retry3.dv.dvrescue.xml" > /dev/null 2>&1
+check "finish: without list the takes are found by name (empty take ignored)" "cmp -s $W/merged.dv $W/cap/T.merged.dv"
+cp "$W/clean.dv" "$W/cap/Solo.dv"
+if "$OLDDV" --finish "$W/cap/Solo.dv" >/dev/null 2>&1; then solo=0; else solo=$?; fi
+check "finish: a capture without re-reads has nothing to merge" "[ $solo = 2 ] && [ ! -e $W/cap/Solo.merged.dv ]"
+
 check "merge with repeated time codes keeps all 358 frames" "grep -q 'Frames: *358' $W/m2.txt"
 check "merge with repeated time codes repairs everything" "grep -q 'Frames with issues: *0' $W/m2.txt || grep -q 'video errors: *0 frames' $W/m2.txt"
 

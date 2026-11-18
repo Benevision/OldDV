@@ -2,7 +2,7 @@
  * OldDV Rescue - player (see OVPlayer.h)
  */
 #import "OVPlayer.h"
-#import <QTKit/QTKit.h>
+#import "OVMovie.h"
 #import "OVEngine.h"
 #import "OVViews.h"
 
@@ -46,7 +46,7 @@ static NSButton *btn(NSView *v, NSRect r, NSString *title, id target, SEL action
         frames[i].sta = NULL;
     fps = frames[0].dsf ? 25.0 : 30000.0 / 1001.0;
     shown = -1;
-    movie = [[QTMovie movieWithFile:file error:NULL] retain];
+    movie = [[OVMovie movieWithFile:file] retain];
 
     window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, W, H)
                                          styleMask:NSTitledWindowMask | NSClosableWindowMask | NSMiniaturizableWindowMask | NSResizableWindowMask
@@ -97,15 +97,16 @@ static NSButton *btn(NSView *v, NSRect r, NSString *title, id target, SEL action
     [errCheck setTarget:self];
     [errCheck setAction:@selector(errToggled:)];
     [v addSubview:errCheck];
-    if (!movie) {
+    if (!movie || ![OVMovie hasSound]) {
         NSTextField *w = [[[NSTextField alloc] initWithFrame:NSMakeRect(700, 18, W - 712, 18)] autorelease];
         [w setBezeled:NO];
         [w setDrawsBackground:NO];
         [w setEditable:NO];
-        [w setStringValue:@"QuickTime cannot open this file: no picture, no sound."];
+        [w setStringValue:movie ? @"No sound on this system." : @"This file cannot be opened: no picture, no sound."];
         [w setAutoresizingMask:NSViewWidthSizable | NSViewMaxYMargin];
         [v addSubview:w];
-        [playButton setEnabled:NO];
+        if (!movie)
+            [playButton setEnabled:NO];
     }
     timer = [[NSTimer timerWithTimeInterval:0.04 target:self selector:@selector(tick:) userInfo:nil repeats:YES] retain];
     [[NSRunLoop currentRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
@@ -146,13 +147,13 @@ static NSButton *btn(NSView *v, NSRect r, NSString *title, id target, SEL action
     [playButton setTitle:@"Play"];
 }
 
-- (BOOL)playing { return movie && [movie rate] != 0; }
+- (BOOL)playing { return movie && [movie playing]; }
 
 - (long)movieFrame
 {
-    NSTimeInterval t = 0;
+    double t = 0;
     long i;
-    if (!movie || !QTGetTimeInterval([movie currentTime], &t))
+    if (!movie || ![movie getCurrentTime:&t])
         return shown < 0 ? 0 : shown;
     i = (long)floor(t * fps + 0.05);
     if (i < 0)
@@ -177,7 +178,7 @@ static NSButton *btn(NSView *v, NSRect r, NSString *title, id target, SEL action
         got = fread(buf, 1, size, fp);
     dv_format_tc(tc, f);
     dv_format_rdt(rd, f);
-    [picture setImage:movie ? [movie currentFrameImage] : nil frameData:got == size ? buf : NULL size:got == size ? size : 0
+    [picture setImage:movie ? [movie currentImage] : nil frameData:got == size ? buf : NULL size:got == size ? size : 0
              bitDepth:f->bitdepth wide:f->aspect_n == 16 caption:[NSString stringWithFormat:@"%s", tc[0] ? tc : "--:--:--:--"]];
     s = [NSMutableString stringWithFormat:@"Frame %ld of %u   %s   %s   ", idx + 1, count, tc[0] ? tc : "--:--:--:--", rd];
     if (f->video_errors || f->audio_errors)
@@ -198,7 +199,7 @@ static NSButton *btn(NSView *v, NSRect r, NSString *title, id target, SEL action
     if (idx >= (long)count)
         idx = (long)count - 1;
     if (movie)
-        [movie setCurrentTime:QTMakeTimeWithTimeInterval((idx + 0.25) / fps)];
+        [movie setCurrentTime:(idx + 0.25) / fps];
     [self display:idx];
 }
 

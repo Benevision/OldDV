@@ -2,7 +2,9 @@
  * OldDV Rescue - capture backend base class + QTKit backend.
  */
 #import "OVCapture.h"
+#ifndef OLDDV_MODERN
 #import <QTKit/QTKit.h>
+#endif
 #include <libkern/OSAtomic.h>
 #include <dlfcn.h>
 
@@ -26,6 +28,7 @@
 
 /* ------------------------------------------------------------------ */
 
+#ifndef OLDDV_MODERN
 @interface OVQTKitBackend : OVCaptureBackend {
     QTCaptureSession *session;
     QTCaptureDevice *device;
@@ -37,6 +40,8 @@
     NSString *fallbackPath;
 }
 @end
+
+#endif
 
 @implementation OVCaptureBackend
 
@@ -66,13 +71,13 @@
     BOOL avf = [self avFoundationAvailable], qt = [self qtKitAvailable];
     Class c = Nil;
     if (choice == OVEngineQTKit && qt)
-        c = [OVQTKitBackend class];
+        c = NSClassFromString(@"OVQTKitBackend");
     else if (choice == OVEngineAVFoundation && avf)
         c = NSClassFromString(@"OVAVFBackend");
     else if (avf)
         c = NSClassFromString(@"OVAVFBackend");
     else if (qt)
-        c = [OVQTKitBackend class];
+        c = NSClassFromString(@"OVQTKitBackend");
     if (!c)
         return nil;
     return [[[c alloc] init] autorelease];
@@ -101,6 +106,7 @@
 
 /* ------------------------------------------------------------------ */
 
+#ifndef OLDDV_MODERN
 @implementation OVQTKitBackend
 
 - (NSString *)engineName { return @"QTKit"; }
@@ -257,3 +263,4 @@
     [super dealloc];
 }
 @end
+#endif

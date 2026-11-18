@@ -122,6 +122,7 @@ typedef struct OVLiveStats {
     NSMutableArray *takes;
     NSString *baseName;     /* full path without .dv */
     int retryCount;
+    BOOL mergeLater;        /* leave the takes unmerged, write NAME.olddv */
     double noDataTimeout;
     BOOL blankLogged;
     NSString *destFolder;   /* nil: record straight into the chosen folder */
@@ -152,6 +153,10 @@ typedef struct OVLiveStats {
 /* the main capture file where it ended up (destination, or this Mac if
  * the copy did not succeed); nil before the first capture */
 - (NSString *)resultPath;
+/* YES: after the re-read passes the takes are not merged on this Mac; a
+ * list NAME.olddv is written, to merge them later, here or on another
+ * machine. Call before -startRecordingTo:. */
+- (void)setMergeLater:(BOOL)later;
 - (BOOL)startRecordingTo:(NSString *)basePath retries:(int)retries noDataTimeout:(double)seconds
                 playDeck:(BOOL)play error:(NSString **)err;
 - (void)stopRecording;          /* user stop (also cancels retries) */

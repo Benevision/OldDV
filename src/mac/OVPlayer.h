@@ -1,12 +1,12 @@
 /*
- * OldDV Rescue - player: plays a DV file (picture and sound through
- * QuickTime) and shows the damaged blocks of each frame over the picture,
+ * OldDV Rescue - player: plays a DV file (picture and, on 10.6 - 10.14,
+ * sound: see OVMovie.h) and shows the damaged blocks of each frame over the picture,
  * with the error timeline under it.
  */
 #import <Cocoa/Cocoa.h>
 #include "dvcore.h"
 
-@class QTMovie, OVGraphView, OVPictureView;
+@class OVMovie, OVGraphView, OVPictureView;
 
 @interface OVPlayer : NSObject {
     NSWindow *window;
@@ -14,7 +14,7 @@
     OVGraphView *graph;
     NSButton *playButton, *errCheck;
     NSTextField *info;
-    QTMovie *movie;
+    OVMovie *movie;
     NSString *path;
     dv_frame *frames;       /* copy of the report's frames, sta not kept */
     uint32_t count;

@@ -19,14 +19,27 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.3.0</string>
+	<string>1.4.0</string>
 	<key>CFBundleVersion</key>
-	<string>1.3.0</string>
+	<string>1.4.0</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>10.6.0</string>
 	<key>LSArchitecturePriority</key>
 	<array>
 		<string>x86_64</string>
+	</array>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>OldDV Rescue capture</string>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>olddv</string>
+			</array>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+		</dict>
 	</array>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>

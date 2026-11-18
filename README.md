@@ -29,7 +29,7 @@ retrying a bad section during the first pass: the re-reads run as passes after i
 
 ### Option A: prebuilt app
 
-1. Copy `dist/OldDV-Rescue-1.3.0-mac.zip` to the Mac and double-click it.
+1. Copy `dist/OldDV-Rescue-1.4.0-mac.zip` to the Mac and double-click it.
 2. Drag **OldDV Rescue.app** to *Applications*.
 3. On 10.6 it just opens. On 10.8+ Gatekeeper may say the app is from an unidentified
    developer: right-click (Ctrl-click) the app, choose **Open**, then confirm once.
@@ -54,6 +54,16 @@ cd OldDV
 This builds `build/OldDV Rescue.app`, copies it to /Applications, and also builds the
 command line tool `build/olddv`. A build on 10.11 includes both capture engines and runs
 on 10.6 as well.
+
+### On a current Mac (macOS 11 and later, Apple Silicon or Intel): finish captures, no capture
+
+Current systems have no QTKit, and macOS 26 and later no FireWire at all, so they cannot
+capture. They are much faster than the old Mac, though, and can do everything that
+comes after the capture. `./build.sh` notices the missing QTKit and builds
+`build/modern/OldDV Rescue.app` for the Mac it runs on (needs Xcode or the command line
+tools): Analyze, Merge Takes (with **Open Capture...**), Package & Export and the player,
+which is silent there because the system does not decode the sound of a raw DV stream.
+This build does not run on the old Mac, and the old Mac's build does not run here.
 
 ## Hardware setup
 
@@ -89,6 +99,12 @@ on 10.6 as well.
      "rewind count", run as a pass after the capture. It needs deck control and a tape with
      time code, which consumer DV always has. If more than 30 % of the frames have errors,
      the retry is skipped: capture the whole tape a second time and use *Merge Takes*.
+     The popup next to it chooses where the takes are merged. *then merge on this Mac*
+     does it right after the last pass. On an old Mac that takes long: every take is read
+     and the whole tape is written again, on one slow disk. *merge later, on any Mac*
+     skips it: the capture ends after the last re-read, the takes stay as they are and
+     a small text file `name.olddv` lists them. Merge them when you like, on this Mac or
+     on a faster one that sees the files (see *Merge Takes*).
      **The section retry has not been validated on real hardware yet; leave it at 0 for
      tapes that matter.**
 4. **Start Capture**. The timeline shows the capture as it happens:
@@ -145,6 +161,15 @@ the picture alone.
 frames with issues.
 
 ### Merge Takes
+
+**A capture that was left unmerged** (*merge later*): click **Open Capture...** and choose
+its `name.olddv` file (double-clicking that file also works), or its first pass
+`name.dv`. The takes (`name.dv`, `name.retry1.dv`, ...) are listed and the output is set
+to `name.merged.dv` next to them; click **Merge**. The takes are only read. Keep all the
+files of a capture in one folder; the folder itself can be moved or copied anywhere.
+Merging straight on a network share works, but reads and writes the whole tape over
+the network: copying the folder to the fast Mac first is quicker. From Terminal:
+`olddv --finish name.olddv`.
 
 Add two or more captures of the same tape, choose an output file and click **Merge**.
 The **first** capture is the timeline: the merged file has its frames, in its order. The
@@ -285,6 +310,10 @@ olddv take1.dv take2.dv take3.dv -m merged.dv --merge-log merge.txt
 ```
 
 ```bash
+olddv --finish Tape.olddv -p
+```
+
+```bash
 olddv tape.dv --split parts/tape --by rec,format --min 25
 ```
 
@@ -345,13 +374,13 @@ messages in the Capture log, or in Console.app, say what went wrong.
 
 ```
 src/core/      portable C: DV analysis (dvanalyze.c), XML/CSV report (dvreport.c),
-               merge (dvmerge.c), packager (dvsplit.c), lossless .mov and .mkv writers
+               merge (dvmerge.c), the files of a capture (dvcapture.c), packager (dvsplit.c), lossless .mov and .mkv writers
                (dvmov.c, dvmkv.c), closed captions (dvcc.c), buffered writer and background
                copy for slow/network disks (dvwriter.c, dvmirror.c)
 src/cli/       olddv command line tool
 src/mac/       Cocoa app: OVApp (window), OVEngine (capture + retries), OVCapture
                (QTKit / AVFoundation), OVDeck (AV/C control), OVViews (timeline, block map, picture with
-               error marks), OVPlayer (player window)
+               error marks), OVPlayer (player window), OVMovie (picture through QTKit or AVFoundation)
 tests/         damage injector, comparison with DVRescue, self test
 tools/         cross build, icon
 dist/          prebuilt app (zip)
