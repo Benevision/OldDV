@@ -27,7 +27,7 @@ and DVRescue's Qt player/GUI.
 
 ### Option A: prebuilt app
 
-1. Copy `dist/OldDV-Rescue-1.1.0-mac.zip` to the Mac and double-click it.
+1. Copy `dist/OldDV-Rescue-1.2.0-mac.zip` to the Mac and double-click it.
 2. Drag **OldDV Rescue.app** to *Applications*.
 3. On 10.6 it just opens. On 10.8+ Gatekeeper may say the app is from an unidentified
    developer: right-click (Ctrl-click) the app, choose **Open**, then confirm once.
@@ -89,9 +89,20 @@ on 10.6 as well.
      the retry is skipped: capture the whole tape a second time and use *Merge Takes*.
      **The section retry has not been validated on real hardware yet; leave it at 0 for
      tapes that matter.**
-4. **Start Capture**. The graph shows errors as they happen. Red bars mean concealed video
-   blocks, orange bars mean audio errors, blue marks show a new recording on the tape, and
-   yellow marks show a time code break.
+4. **Start Capture**. The timeline shows the capture as it happens:
+   * red bars are concealed video blocks, orange bars (from the top) are audio errors, blue
+     marks show a new recording on the tape, and yellow marks show a time code break;
+   * the ruler at the bottom gives the tape time code, and the light blue marker with its
+     time code shows where the tape is, also while the deck winds to a section;
+   * with *Re-read sections with errors*, there is one thin row per pass under the bars.
+     Amber is a section still to be read, white is the section being read, green is a
+     section that is now clean, blue is a section that was read but still has errors, and
+     grey is a section that was skipped. Errors that a re-read repaired turn green;
+   * move the mouse over the timeline to see the time code, the errors and the number of
+     re-reads of that place.
+
+   During the re-reads the status line shows the pass and the section, for example
+   `Re-read 2/3, sect. 4/12`.
 
 Each `.dv` file gets a `.dv.dvrescue.xml` report next to it, and the Capture log is saved
 as `name.log` in the same folder (and always in `~/Library/Logs/OldDV Rescue.log`).

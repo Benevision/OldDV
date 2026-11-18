@@ -13,8 +13,36 @@
 typedef struct OVGraphPoint {
     uint16_t video;   /* per mille of video blocks with errors */
     uint16_t audio;   /* audio blocks with errors */
-    uint8_t  flags;   /* 1 time code break, 2 recording start, 4 fully concealed, 8 rec date jump */
+    uint8_t  flags;   /* 1 time code break, 2 recording start, 4 fully concealed, 8 rec date jump,
+                       * 16 repaired by a re-read, 32 PAL (25 frames per second), 64 on the re-read list */
+    int32_t  tc;      /* time code in frames, -1: none */
 } OVGraphPoint;
+
+/* One section of the tape that a retry pass reads again */
+enum {
+    OVSectionPending = 0,
+    OVSectionSeeking,   /* the deck winds to it */
+    OVSectionReading,
+    OVSectionRead,      /* read, result not known before the end of the pass */
+    OVSectionClean,     /* every frame of it is now good in one of the takes */
+    OVSectionPartial,   /* read, some frames still have errors */
+    OVSectionSkipped    /* seek failed, or the retries were stopped */
+};
+
+typedef struct OVRetrySection {
+    int64_t  tcStart, tcEnd;  /* time codes in frames */
+    uint32_t first, last;     /* graph points (frames of the first pass); first > last: unknown */
+    uint8_t  pass;            /* 1, 2... */
+    uint8_t  state;           /* OVSection... */
+} OVRetrySection;
+
+typedef struct OVRetryStatus {
+    int      planned;         /* retry passes that will be / were made; 0: none */
+    int      pass;            /* pass under way, 0 before the first */
+    int      section, sections; /* section under way and sections of this pass */
+    int64_t  headTC;          /* tape position during the retries, -1: unknown */
+    unsigned revision;        /* changes when sections or the flags of graph points change */
+} OVRetryStatus;
 
 void OVGraphPointFromFrame(const dv_frame *f, OVGraphPoint *p);
 
@@ -84,6 +112,12 @@ typedef struct OVLiveStats {
     OVGraphPoint *points;
     size_t npoints, cappoints;
 
+    OVRetrySection *sections; /* all passes, in the order they are read */
+    size_t nsections, capsections;
+    int plannedRetries, curPass, curSection, passSections;
+    int64_t headTC;
+    unsigned graphRev;
+
     NSMutableIndexSet *badKeys;
     NSMutableArray *takes;
     NSString *baseName;     /* full path without .dv */
@@ -126,5 +160,7 @@ typedef struct OVLiveStats {
 - (OVDeckState)cachedDeckState;
 - (size_t)copyGraphPointsFrom:(size_t)start into:(OVGraphPoint *)buf max:(size_t)max;
 - (size_t)graphPointCount;
+- (OVRetryStatus)retryStatus;
+- (size_t)copyRetrySections:(OVRetrySection *)buf max:(size_t)max;
 - (NSString *)currentFile;
 @end

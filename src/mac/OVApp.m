@@ -182,6 +182,7 @@ static NSString *fmtDuration(uint64_t frames, int pal)
     OVGraphView *liveGraph;
     NSTextView *captureLog;
     size_t graphCopied;
+    unsigned graphRevision;
     NSString *lastCapture;
 
     /* analyze tab */
@@ -327,12 +328,12 @@ static void log_to_main(void *ctx, const char *line)
     statsLabel2 = mkLabel(v, NSMakeRect(x + 262, y - 92, W - x - 274, 92), @"");
     [statsLabel2 setFont:[NSFont userFixedPitchFontOfSize:11]];
 
-    liveGraph = [[OVGraphView alloc] initWithFrame:NSMakeRect(12, 146, W - 24, 92)];
+    liveGraph = [[OVGraphView alloc] initWithFrame:NSMakeRect(12, 116, W - 24, 122)];
     [liveGraph setAutoresizingMask:NSViewWidthSizable];
-    [liveGraph setEmptyText:@"Errors of the capture appear here: red = video blocks concealed, orange = audio errors, blue = new recording, yellow = time code break"];
+    [liveGraph setEmptyText:@"Errors of the capture appear here: red = video blocks concealed, orange = audio errors, blue = new recording, yellow = time code break. Move the mouse over it for details."];
     [v addSubview:liveGraph];
     [liveGraph release];
-    captureLog = mkTextView(v, NSMakeRect(12, 12, W - 24, 128), NSViewWidthSizable | NSViewHeightSizable);
+    captureLog = mkTextView(v, NSMakeRect(12, 12, W - 24, 98), NSViewWidthSizable | NSViewHeightSizable);
 }
 
 - (OVEngineChoice)engineChoice { return (OVEngineChoice)[enginePopup indexOfSelectedItem]; }
@@ -600,6 +601,7 @@ static BOOL OVFolderIsRemote(NSString *folder)
     char tc[16] = "", rd[48] = "";
     NSString *status;
     OVGraphPoint buf[2048];
+    OVRetryStatus rs = [engine retryStatus];
     size_t n;
     if (s.haveFrame) {
         dv_format_tc(tc, &s.last);
@@ -618,7 +620,10 @@ static BOOL OVFolderIsRemote(NSString *folder)
         else
             status = @"RECORDING";
         break;
-    case OVEngineRetrying: status = @"Re-reading bad sections"; break;
+    case OVEngineRetrying:
+        status = rs.pass ? [NSString stringWithFormat:@"Re-read %d/%d, sect. %d/%d", rs.pass, rs.planned, rs.section, rs.sections]
+                         : @"Re-reading bad sections";
+        break;
     case OVEngineMerging: status = @"Merging takes"; break;
     case OVEngineCopying: status = @"Copying to the folder"; break;
     default: status = @"Not connected";
@@ -645,11 +650,28 @@ static BOOL OVFolderIsRemote(NSString *folder)
                                    [OVDeck describeState:[engine cachedDeckState]]]];
     else
         [deckLabel setStringValue:@"Deck: no AV/C control"];
+    if (rs.revision != graphRevision) {
+        /* re-read sections or repaired frames changed: take everything again */
+        size_t np = [engine graphPointCount], ns = 4096;
+        OVGraphPoint *all = (OVGraphPoint *)malloc((np + 1) * sizeof(OVGraphPoint));
+        OVRetrySection *sec = (OVRetrySection *)malloc(ns * sizeof(OVRetrySection));
+        graphRevision = rs.revision;
+        if (all) {
+            np = [engine copyGraphPointsFrom:0 into:all max:np];
+            [liveGraph setPoints:all count:np];
+            graphCopied = np;
+        }
+        ns = sec ? [engine copyRetrySections:sec max:ns] : 0;
+        [liveGraph setSections:sec count:ns passes:rs.planned];
+        free(all);
+        free(sec);
+    }
     if (st == OVEngineRecording)
         while ((n = [engine copyGraphPointsFrom:graphCopied into:buf max:2048]) > 0) {
             [liveGraph appendPoints:buf count:n];
             graphCopied += n;
         }
+    [liveGraph setHeadMode:st == OVEngineRecording ? 1 : (st == OVEngineRetrying ? 2 : 0) tc:rs.headTC];
 }
 
 - (void)tick:(NSTimer *)t

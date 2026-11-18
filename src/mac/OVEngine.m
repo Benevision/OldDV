@@ -29,7 +29,9 @@ void OVGraphPointFromFrame(const dv_frame *f, OVGraphPoint *p)
     p->video = (uint16_t)(v > 1000 ? 1000 : v);
     p->audio = (uint16_t)f->audio_errors;
     p->flags = (uint8_t)((f->tc_nc ? 1 : 0) | (f->rec_start ? 2 : 0)
-                         | ((f->full_conceal_vid && f->full_conceal_aud) ? 4 : 0) | (f->rdt_nc ? 8 : 0));
+                         | ((f->full_conceal_vid && f->full_conceal_aud) ? 4 : 0) | (f->rdt_nc ? 8 : 0)
+                         | (f->dsf ? 32 : 0));
+    p->tc = (int32_t)tc_key(f);
 }
 
 @interface OVEngine (Private)
@@ -67,6 +69,7 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t size, int64_t pos)
     [self disconnect];
     dv_splitter_free(&splitter);
     free(points);
+    free(sections);
     [badKeys release];
     [takes release];
     dispatch_release(deckQueue);
@@ -223,8 +226,11 @@ static void append_line(NSString *path, NSString *text)
         }
         if (npoints < cappoints)
             OVGraphPointFromFrame(&f, &points[npoints++]);
-        if (dv_frame_error_blocks(&f) && tc_key(&f) >= 0)
+        if (dv_frame_error_blocks(&f) && tc_key(&f) >= 0) {
             [badKeys addIndex:(NSUInteger)tc_key(&f)];
+            if (npoints)
+                points[npoints - 1].flags |= 64;
+        }
     } else {
         dv_analyze_frame(&liveAnalyzer, data, size, pos, &f);
         free(f.sta);
@@ -317,6 +323,31 @@ static void append_line(NSString *path, NSString *text)
             n = max;
         memcpy(buf, points + start, n * sizeof(OVGraphPoint));
     }
+    pthread_mutex_unlock(&mtx);
+    return n;
+}
+
+- (OVRetryStatus)retryStatus
+{
+    OVRetryStatus r;
+    pthread_mutex_lock(&mtx);
+    r.planned = plannedRetries;
+    r.pass = curPass;
+    r.section = curSection;
+    r.sections = passSections;
+    r.headTC = headTC;
+    r.revision = graphRev;
+    pthread_mutex_unlock(&mtx);
+    return r;
+}
+
+- (size_t)copyRetrySections:(OVRetrySection *)buf max:(size_t)max
+{
+    size_t n;
+    pthread_mutex_lock(&mtx);
+    n = nsections < max ? nsections : max;
+    if (n)
+        memcpy(buf, sections, n * sizeof(OVRetrySection));
     pthread_mutex_unlock(&mtx);
     return n;
 }
@@ -443,6 +474,11 @@ static void append_line(NSString *path, NSString *text)
     pthread_mutex_lock(&mtx);
     [badKeys removeAllIndexes];
     npoints = 0;
+    nsections = 0;
+    plannedRetries = deck ? retries : 0;
+    curPass = curSection = passSections = 0;
+    headTC = -1;
+    graphRev++;
     lastDataTime = 0;
     /* switch to recording atomically with a splitter restart, so that the
      * bytes written to the file and the frame positions start together */
@@ -502,6 +538,10 @@ static void append_line(NSString *path, NSString *text)
         }
     } else if (retryCount > 0 && !cancel)
         [self log:@"No frame with errors: no retry needed."];
+    pthread_mutex_lock(&mtx);
+    plannedRetries = 0; /* no section will be read again */
+    graphRev++;
+    pthread_mutex_unlock(&mtx);
     if (autoStopDeck && deck) {
         OVDeck *d = deck;
         dispatch_async(deckQueue, ^{ [d stop]; });
@@ -729,6 +769,72 @@ static int copy_cancel_cb(void *ctx, double f)
 /* ------------------------------------------------------------------ */
 /* Rewind and retry (worker thread)                                    */
 
+/* The sections of a retry pass, for the timeline. ranges: (first, last)
+ * time codes, sorted. Returns the index of the first one, -1 without
+ * memory. Called with mtx held. */
+- (long)addSections:(NSArray *)ranges pass:(int)pass fps:(int)fps
+{
+    size_t n = [ranges count], base = nsections, i, j;
+    if (nsections + n > capsections) {
+        size_t nc = nsections + n + 64;
+        OVRetrySection *ns = (OVRetrySection *)realloc(sections, nc * sizeof(OVRetrySection));
+        if (!ns)
+            return -1;
+        sections = ns;
+        capsections = nc;
+    }
+    for (i = 0; i < n; i++) {
+        OVRetrySection *s = &sections[base + i];
+        NSArray *rg = [ranges objectAtIndex:i];
+        s->tcStart = [[rg objectAtIndex:0] longLongValue];
+        s->tcEnd = [[rg objectAtIndex:1] longLongValue];
+        s->first = 1;
+        s->last = 0;
+        s->pass = (uint8_t)pass;
+        s->state = OVSectionPending;
+    }
+    /* where each section is in the first pass. A tape whose time code
+     * starts again has the same time codes twice: keep the first place. */
+    for (j = 0; j < npoints && n; j++) {
+        int64_t k = points[j].tc;
+        size_t lo = 0, hi = n;
+        OVRetrySection *s;
+        if (k < 0)
+            continue;
+        while (hi - lo > 1) {
+            size_t mid = (lo + hi) / 2;
+            if (sections[base + mid].tcStart <= k) lo = mid; else hi = mid;
+        }
+        s = &sections[base + lo];
+        if (k < s->tcStart || k > s->tcEnd)
+            continue;
+        if (s->first > s->last)
+            s->first = s->last = (uint32_t)j;
+        else if (j - s->last <= (size_t)(3 * fps))
+            s->last = (uint32_t)j;
+    }
+    nsections += n;
+    graphRev++;
+    return (long)base;
+}
+
+- (void)setSection:(long)i state:(int)st
+{
+    pthread_mutex_lock(&mtx);
+    if (i >= 0 && (size_t)i < nsections) {
+        sections[i].state = (uint8_t)st;
+        graphRev++;
+    }
+    pthread_mutex_unlock(&mtx);
+}
+
+- (void)setHeadTC:(int64_t)k
+{
+    pthread_mutex_lock(&mtx);
+    headTC = k;
+    pthread_mutex_unlock(&mtx);
+}
+
 - (int64_t)liveTC:(double)maxAge
 {
     int64_t k = -1;
@@ -765,15 +871,14 @@ static int copy_cancel_cb(void *ctx, double f)
             (int)(k / fps % 60), (int)(k % fps)];
 }
 
-- (BOOL)seekTo:(int64_t)target
+/* one winding towards target: 0 failed, 1 already there, 2 wound */
+- (int)windTo:(int64_t)target
 {
     int64_t pos = [self deckTC];
     int dir;
     double t0;
     BOOL shuttle = NO;
     double lastKnown, lastCmd;
-    if (target < 0) /* section at the very start of the tape */
-        target = 0;
     if (pos < 0) {
         /* play a moment to learn where we are */
         [deck play];
@@ -783,14 +888,15 @@ static int copy_cancel_cb(void *ctx, double f)
     }
     if (pos < 0) {
         [self log:@"  Cannot read the tape position (no time code)."];
-        return NO;
+        return 0;
     }
+    [self setHeadTC:pos];
     if (pos > target)
         dir = -1;
     else if (pos < target - 10 * [self fps])
         dir = 1;
     else
-        return YES;
+        return 1;
     if (dir < 0) [deck rewind]; else [deck fastForward];
     t0 = now_s();
     lastKnown = lastCmd = t0;
@@ -799,6 +905,8 @@ static int copy_cancel_cb(void *ctx, double f)
         if (now_s() - lastCmd > 2 && [deck state] == OVDeckStopped)
             break; /* the deck stopped by itself: beginning / end of the tape */
         pos = [self deckTC];
+        if (pos >= 0)
+            [self setHeadTC:pos];
         if (pos < 0) {
             if (now_s() - lastKnown > 6 && dir < 0 && !shuttle) {
                 /* deck does not report time code while winding: shuttle instead */
@@ -810,7 +918,7 @@ static int copy_cancel_cb(void *ctx, double f)
             } else if (now_s() - lastKnown > 15) {
                 [self log:@"  The deck does not report its position while winding."];
                 [deck stop];
-                return NO;
+                return 0;
             }
             continue;
         }
@@ -820,7 +928,24 @@ static int copy_cancel_cb(void *ctx, double f)
     }
     [deck stop];
     usleep(1000000);
-    return !cancel && now_s() - t0 < 300;
+    return (!cancel && now_s() - t0 < 300) ? 2 : 0;
+}
+
+/* Winds to just before target. A deck that winds forward stops late, past
+ * the place: wind again (backwards) until the tape is before it. */
+- (BOOL)seekTo:(int64_t)target
+{
+    int attempt;
+    if (target < 0) /* section at the very start of the tape */
+        target = 0;
+    for (attempt = 0; attempt < 6 && !cancel; attempt++) {
+        int r = [self windTo:target];
+        if (r == 1)
+            return YES;
+        if (r == 0)
+            return NO;
+    }
+    return NO;
 }
 
 - (void)retryMain:(id)unused
@@ -835,6 +960,7 @@ static int copy_cancel_cb(void *ctx, double f)
         dv_report *r;
         NSUInteger idx;
         int64_t rs = -1, re = -1;
+        long secBase, secIdx = 0;
         /* contiguous bad sections (gaps under 2 s are joined) */
         pthread_mutex_lock(&mtx);
         for (idx = [badKeys firstIndex]; idx != NSNotFound; idx = [badKeys indexGreaterThanIndex:idx]) {
@@ -847,6 +973,12 @@ static int copy_cancel_cb(void *ctx, double f)
         }
         if (rs >= 0)
             [ranges addObject:[NSArray arrayWithObjects:[NSNumber numberWithLongLong:rs], [NSNumber numberWithLongLong:re], nil]];
+        secBase = [ranges count] ? [self addSections:ranges pass:pass fps:fps] : -1;
+        if ([ranges count]) {
+            curPass = pass;
+            curSection = 0;
+            passSections = (int)[ranges count];
+        }
         pthread_mutex_unlock(&mtx);
         if (![ranges count]) {
             [self log:@"No bad section left."];
@@ -862,13 +994,22 @@ static int copy_cancel_cb(void *ctx, double f)
         for (NSArray *rg in ranges) {
             int64_t a = [[rg objectAtIndex:0] longLongValue], b = [[rg objectAtIndex:1] longLongValue];
             double t0, lastData;
+            long sec = secBase >= 0 ? secBase + secIdx : -1;
+            secIdx++;
             if (cancel)
                 break;
-            [self log:[NSString stringWithFormat:@"  Section %@ - %@: seeking...", [self tcString:a], [self tcString:b]]];
+            pthread_mutex_lock(&mtx);
+            curSection = (int)secIdx;
+            pthread_mutex_unlock(&mtx);
+            [self setSection:sec state:OVSectionSeeking];
+            [self log:[NSString stringWithFormat:@"  Section %ld of %lu, %@ - %@: seeking...", secIdx,
+                       (unsigned long)[ranges count], [self tcString:a], [self tcString:b]]];
             if (![self seekTo:a - 3 * fps]) {
                 [self log:@"  Seek failed, section skipped."];
+                [self setSection:sec state:OVSectionSkipped];
                 continue;
             }
+            [self setSection:sec state:OVSectionReading];
             pthread_mutex_lock(&mtx);
             winStart = a - fps;
             winEnd = b + fps;
@@ -879,8 +1020,10 @@ static int copy_cancel_cb(void *ctx, double f)
             while (!cancel) {
                 int64_t k = [self liveTC:0.5];
                 usleep(100000);
-                if (k >= 0)
+                if (k >= 0) {
                     lastData = now_s();
+                    [self setHeadTC:k];
+                }
                 if (k > b + fps)
                     break;
                 if (now_s() - lastData > 6 || now_s() - t0 > (double)(b - a) / fps + 30) {
@@ -891,6 +1034,7 @@ static int copy_cancel_cb(void *ctx, double f)
             pthread_mutex_lock(&mtx);
             retryWindow = 0;
             pthread_mutex_unlock(&mtx);
+            [self setSection:sec state:OVSectionRead];
             [deck pause];
         }
         [deck stop];
@@ -909,6 +1053,21 @@ static int copy_cancel_cb(void *ctx, double f)
                     fixed++;
                 }
             }
+            /* the timeline: what this pass repaired */
+            {
+                size_t j;
+                for (j = 0; j < npoints; j++)
+                    if ((points[j].flags & 64) && !(points[j].flags & 16) && points[j].tc >= 0
+                        && ![badKeys containsIndex:(NSUInteger)points[j].tc])
+                        points[j].flags |= 16;
+                for (j = 0; j < nsections; j++)
+                    if (sections[j].pass == pass && sections[j].state == OVSectionRead)
+                        sections[j].state = [badKeys countOfIndexesInRange:
+                                             NSMakeRange((NSUInteger)sections[j].tcStart,
+                                                         (NSUInteger)(sections[j].tcEnd - sections[j].tcStart + 1))]
+                            ? OVSectionPartial : OVSectionClean;
+                graphRev++;
+            }
             pthread_mutex_unlock(&mtx);
             [self log:[NSString stringWithFormat:@"  Pass %d: %u frames re-read, %u now clean, %lu frames still with errors",
                        pass, r->count, fixed, (unsigned long)[badKeys count]]];
@@ -920,6 +1079,20 @@ static int copy_cancel_cb(void *ctx, double f)
             free(r);
         }
     }
+    /* whatever was not read (stopped, or the file could not be made) */
+    pthread_mutex_lock(&mtx);
+    {
+        size_t j;
+        for (j = 0; j < nsections; j++)
+            if (sections[j].state < OVSectionRead)
+                sections[j].state = OVSectionSkipped;
+            else if (sections[j].state == OVSectionRead)
+                sections[j].state = OVSectionPartial;
+        curSection = 0;
+        headTC = -1;
+        graphRev++;
+    }
+    pthread_mutex_unlock(&mtx);
     if ([takes count] > 1) {
         NSString *merged = [baseName stringByAppendingString:@".merged.dv"];
         const char *in[64];
@@ -935,8 +1108,9 @@ static int copy_cancel_cb(void *ctx, double f)
             dv_report_init(&mr, [merged fileSystemRepresentation]);
             dv_analyze_file([merged fileSystemRepresentation], &mr, NULL, NULL);
             dv_report_save_xml([[merged stringByAppendingString:@".dvrescue.xml"] fileSystemRepresentation], &mr);
-            [self log:[NSString stringWithFormat:@"Merged: %u frames, %u repaired from other takes, %u still with errors (%u blocks fixed).",
-                       ms.frames_out, ms.frames_repaired, ms.frames_still_bad, ms.blocks_fixed]];
+            [self log:[NSString stringWithFormat:@"Merged: %u frames: %u without errors in one of the takes, %u repaired by mixing "
+                       @"blocks of several takes (%u blocks), %u still with errors.",
+                       ms.frames_out, ms.frames_ok, ms.frames_repaired, ms.blocks_fixed, ms.frames_still_bad]];
             dv_report_free(&mr);
         } else
             [self log:@"Merge failed."];

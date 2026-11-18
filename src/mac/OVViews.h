@@ -4,9 +4,17 @@
 #import <Cocoa/Cocoa.h>
 #import "OVEngine.h"
 
-/* Timeline of errors per frame: red bars (from bottom) = video blocks with
- * errors, orange bars (from top) = audio errors, blue marks = recording
- * starts, yellow marks = time code breaks. Click to select a frame. */
+/* Timeline of a capture, one column per group of frames.
+ *   top:     blue marks = recording starts, yellow marks = time code breaks,
+ *            orange bars = audio errors
+ *   middle:  red bars = video blocks with errors (magenta: nothing readable),
+ *            green = repaired by a re-read
+ *   lanes:   one row per re-read pass: amber = to be read, white = being
+ *            read, green = now clean, blue = read but errors remain,
+ *            grey = skipped
+ *   bottom:  tape time codes
+ * A marker shows where the tape is; the mouse shows the details of a
+ * place. Click to select a frame. */
 @interface OVGraphView : NSView {
     OVGraphPoint *points;
     size_t count, cap;
@@ -14,6 +22,13 @@
     id target;
     SEL action;
     NSString *emptyText;
+    OVRetrySection *sections;
+    size_t nsections;
+    int passes;
+    int headMode;
+    int64_t headTC;
+    CGFloat hoverX;
+    NSTrackingArea *tracking;
 }
 - (void)setPoints:(const OVGraphPoint *)p count:(size_t)n;
 - (void)appendPoints:(const OVGraphPoint *)p count:(size_t)n;
@@ -23,6 +38,10 @@
 - (long)selected;
 - (void)setTarget:(id)t action:(SEL)a;
 - (void)setEmptyText:(NSString *)s;
+/* re-read sections of all passes and the number of passes (rows) */
+- (void)setSections:(const OVRetrySection *)s count:(size_t)n passes:(int)p;
+/* marker: 0 none, 1 at the end of the recording, 2 at tape time code tc */
+- (void)setHeadMode:(int)mode tc:(int64_t)tc;
 @end
 
 /* One frame: each row is a DIF sequence (track), each cell an 80 byte
