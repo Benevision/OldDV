@@ -161,6 +161,23 @@ int main(int argc, char **argv)
     NSData *in;
     size_t off = 0, step = 144000 * 5;
     double stopCopyAfter = argc > 5 ? atof(argv[5]) : 0, t0;
+    if (argc == 5 && !strcmp(argv[1], "--picture")) {
+        /* engine_harness --picture FRAME.dv PICTURE.png OUT.png: the player's
+         * picture view with the damaged blocks of the first frame marked */
+        NSData *fr = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:argv[2]]];
+        NSImage *img = [[[NSImage alloc] initWithContentsOfFile:[NSString stringWithUTF8String:argv[3]]] autorelease];
+        size_t fs = [fr length] >= 144000 && (((const uint8_t *)[fr bytes])[3] & 0x80) ? 144000 : 120000;
+        OVPictureView *pv = [[OVPictureView alloc] initWithFrame:NSMakeRect(0, 0, 860, 510)];
+        NSBitmapImageRep *rep;
+        [NSApplication sharedApplication];
+        [pv setImage:img frameData:[fr bytes] size:fs bitDepth:16 wide:NO caption:@"00:00:00:00"];
+        rep = [pv bitmapImageRepForCachingDisplayInRect:[pv bounds]];
+        [pv cacheDisplayInRect:[pv bounds] toBitmapImageRep:rep];
+        [[rep representationUsingType:NSPNGFileType properties:[NSDictionary dictionary]]
+            writeToFile:[NSString stringWithUTF8String:argv[4]] atomically:YES];
+        printf("marks %lu\n", (unsigned long)[pv markCount]);
+        return 0;
+    }
     if (argc == 9 && !strcmp(argv[1], "--sim"))
         return sim_main(argv);
     if (argc < 5)

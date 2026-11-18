@@ -32,13 +32,13 @@ rm -rf "$OUT/obj" "$APP"
 mkdir -p "$OUT/obj" "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 OBJS=""
-for f in src/core/dvanalyze.c src/core/dvreport.c src/core/dvmerge.c src/core/dvsplit.c src/core/dvmov.c src/core/dvwriter.c src/core/dvmirror.c; do
+for f in src/core/dvanalyze.c src/core/dvreport.c src/core/dvmerge.c src/core/dvsplit.c src/core/dvmov.c src/core/dvwriter.c src/core/dvmirror.c src/core/dvmkv.c src/core/dvcc.c; do
   o="$OUT/obj/$(basename "$f" .c).o"
   $CC $CFLAGS -c "$f" -o "$o"
   OBJS="$OBJS $o"
 done
 APPOBJS=""
-for f in OVApp OVCapture OVDeck OVEngine OVViews; do
+for f in OVApp OVCapture OVDeck OVEngine OVViews OVPlayer; do
   $CC $CFLAGS -fobjc-exceptions -c "src/mac/$f.m" -o "$OUT/obj/$f.o"
   APPOBJS="$APPOBJS $OUT/obj/$f.o"
 done

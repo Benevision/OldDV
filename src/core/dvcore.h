@@ -23,7 +23,7 @@
 extern "C" {
 #endif
 
-#define OLDDV_VERSION "1.2.0"
+#define OLDDV_VERSION "1.3.0"
 
 #define DV_BLOCK_SIZE   80
 #define DV_DSEQ_SIZE    12000          /* 150 blocks of 80 bytes */
@@ -312,11 +312,32 @@ int dv_write_mov(const char *in, int64_t start, int64_t end, const char *out,
                  dv_log_cb log, dv_progress_cb progress, void *ctx);
 int dv_write_mov_ex(const char *in, int64_t start, int64_t end, const char *out, int flags,
                     dv_log_cb log, dv_progress_cb progress, void *ctx);
+/* The same as a Matroska file (.mkv): DV video untouched, 16-bit PCM audio */
+int dv_write_mkv(const char *in, int64_t start, int64_t end, const char *out, int flags,
+                 dv_log_cb log, dv_progress_cb progress, void *ctx);
 /* Audio of the first stereo pair as a 16-bit .wav, one frame's worth of
  * samples per DV frame (so it stays in sync with the video of the same
  * range). Returns 0, 1 if the file has no audio, -1 on error. */
 int dv_write_wav(const char *in, int64_t start, int64_t end, const char *out, int flags,
                  dv_log_cb log, dv_progress_cb progress, void *ctx);
+
+/* Rectangle of the picture (720 wide, 576 or 480 high) that video block v
+ * (0..134, counted in file order) of DIF sequence seq holds. */
+void dv_video_block_rect(int dsf, int seq, int v, int *x, int *y, int *w, int *h);
+
+/* --------------------------------------------------------------------- */
+/* Closed captions (EIA-608, NTSC tapes recorded from television)          */
+
+/* the 4 caption bytes of a frame (2 of field 1, 2 of field 2); 1 if present */
+int dv_frame_captions(const uint8_t *frame, size_t size, uint8_t cc[4]);
+
+enum { DV_CC_SCC = 0, DV_CC_SRT = 1, DV_CC_VTT = 2 };
+/* Captions of bytes [start, end) of a DV file: the raw data as Scenarist
+ * .scc, or the text of the first channel of `field` (1 or 2) as .srt /
+ * WebVTT, timed from the start of the range. Returns 0, 1 when there are
+ * no captions (no file is written), -1 on error. */
+int dv_write_captions(const char *in, int64_t start, int64_t end, const char *out, int fmt, int field,
+                      dv_log_cb log, dv_progress_cb progress, void *ctx);
 
 #ifdef __cplusplus
 }

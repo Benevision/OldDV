@@ -56,3 +56,22 @@
 - (void)setFrameData:(const uint8_t *)data size:(size_t)size bitDepth:(int)bits caption:(NSString *)c;
 - (void)clear;
 @end
+
+/* One frame as a picture, with the places of its damaged video blocks
+ * marked over it (red), like DVRescue's player. */
+@interface OVPictureView : NSView {
+    NSImage *image;
+    uint8_t *rects;      /* x, y, w, h as uint16_t each, in picture pixels */
+    size_t nrects;
+    int picH;            /* 576 or 480; 0: no frame */
+    BOOL wideShape, showErrors;
+    unsigned audioErrors;
+    NSString *caption;
+}
+/* image may be nil (the picture cannot be decoded): the marks still show */
+- (void)setImage:(NSImage *)img frameData:(const uint8_t *)data size:(size_t)size bitDepth:(int)bits
+            wide:(BOOL)w caption:(NSString *)c;
+- (void)setShowErrors:(BOOL)on;
+- (void)clear;
+- (size_t)markCount;
+@end

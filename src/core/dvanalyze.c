@@ -717,3 +717,40 @@ void dv_splitter_flush(dv_splitter *s, dv_frame_cb cb, void *ctx)
     s->len = 0;
     s->part_len = 0;
 }
+
+/* Where video block v (0..134, in file order) of DIF sequence seq sits in
+ * the 720 pixel wide picture: the DV shuffling of macroblocks (IEC 61834,
+ * SMPTE 314M). 625/50 is 4:2:0 with 16x16 macroblocks, 525/60 is 4:1:1
+ * with 32x8 macroblocks (16x16 in the last column). */
+void dv_video_block_rect(int dsf, int seq, int v, int *x, int *y, int *w, int *h)
+{
+    static const uint8_t off[5] = { 2, 6, 8, 0, 4 };
+    int slot = v / 5, m = v % 5;
+    if (dsf) {
+        static const uint8_t col[5] = { 18, 9, 27, 0, 36 };
+        static const uint8_t serp[3] = { 0, 1, 2 };
+        int c = slot / 3, r = slot % 3;
+        *x = (col[m] + c) * 16;
+        *y = (((c & 1) ? 2 - serp[r] : serp[r]) + ((seq + off[m]) % 12) * 3) * 16;
+        *w = 16;
+        *h = 16;
+    } else {
+        static const uint8_t col[5] = { 9, 4, 13, 0, 18 };
+        int i = (seq + off[m]) % 10;
+        int k = slot + ((m == 1 || m == 2) ? 3 : 0);
+        int cx = col[m] + k / 6, r = k % 6, cy;
+        if ((k / 6) & 1)
+            r = 5 - r;
+        cy = r + i * 6;
+        *x = cx * 32;
+        if (cx > 21) {
+            *y = (cy * 2 - i * 6) * 8;
+            *w = 16;
+            *h = 16;
+        } else {
+            *y = cy * 8;
+            *w = 32;
+            *h = 8;
+        }
+    }
+}

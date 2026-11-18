@@ -17,17 +17,19 @@ with no dependencies:
 | XML report (`*.dvrescue.xml`) | Same XML format and namespace, so the DVRescue tools can read it |
 | "Rewind and retry" of bad sections (`--rewind-count`) | **Re-read sections with errors** option: rewinds by time code, captures each bad section again, then merges |
 | Merge of several captures, block by block (`--merge`) | **Merge Takes** tab / `olddv -m` |
-| `dvpackager` (split at each recording, rewrap to .mov) | **Package & Export** tab: one file per recording. Lossless `.mov` (DV + PCM) is built in; H.264 `.mp4` / `.mov` need ffmpeg. |
+| `dvpackager` (split at each recording, rewrap to .mov / .mkv) | **Package & Export** tab: one file per recording. Lossless `.mov` and `.mkv` (DV + PCM) are built in; H.264 `.mp4` / `.mov` need ffmpeg. |
+| Closed caption export (SCC, SRT, WebVTT) | **Package & Export** tab / `olddv --scc --srt --vtt`. Tested with made-up captions only, not with a captioned tape. |
 | `dvloupe` / `dvplay` (block error map of a frame) | **Analyze** tab: error timeline, list of bad frames, block map and picture of each frame |
+| Player with the errors shown over the picture | **Play with Errors** in the Analyze tab. Not tried on a 10.6 Mac yet. |
 
-Not included: DeckLink/analog capture, closed caption export (SCC/SRT/WebVTT), MKV output,
-and DVRescue's Qt player/GUI.
+Not included: DeckLink/analog capture (the hardware does not work with a 2009 Mac mini), and
+retrying a bad section during the first pass: the re-reads run as passes after it.
 
 ## Install
 
 ### Option A: prebuilt app
 
-1. Copy `dist/OldDV-Rescue-1.2.0-mac.zip` to the Mac and double-click it.
+1. Copy `dist/OldDV-Rescue-1.3.0-mac.zip` to the Mac and double-click it.
 2. Drag **OldDV Rescue.app** to *Applications*.
 3. On 10.6 it just opens. On 10.8+ Gatekeeper may say the app is from an unidentified
    developer: right-click (Ctrl-click) the app, choose **Open**, then confirm once.
@@ -131,6 +133,14 @@ Open any `.dv` file, or click **Analyze Capture** on the Capture tab. You get:
   the map is a DIF sequence (a tape track). Red cells are concealed video blocks, orange
   cells are audio blocks containing error codes.
 
+**Play with Errors** opens a player window at the selected frame. QuickTime plays the
+picture and the sound; the damaged video blocks of each frame are marked in red where they
+are in the picture, and an orange bar along the bottom means audio errors in that frame.
+The timeline under the picture follows the playback: click it to go somewhere. The buttons
+step one frame (also the left and right arrow keys), jump to the previous or next group of
+frames with errors, and play or pause (space bar). Untick **Mark damaged blocks** to see
+the picture alone.
+
 **Save XML** writes a DVRescue-compatible report. **Save CSV** writes a spreadsheet of the
 frames with issues.
 
@@ -156,6 +166,8 @@ whole file.
 |---|---|---|---|
 | `.dv` | raw DV, your archival master | 13 GB/h | built in |
 | `.mov` (DV) | the same DV video, untouched, plus PCM audio in a QuickTime file. Lossless. Plays in QuickTime 7/X, iMovie, Final Cut, VLC. | 13 GB/h | built in |
+| `.mkv` (DV) | the same in a Matroska file. Lossless. Plays in VLC, mpv, Plex/Jellyfin. | 13 GB/h | built in |
+| captions | closed captions, which only NTSC tapes recorded from television have: `.scc` (the data, untouched), `.srt` and `.vtt` (the text). Nothing is written for a tape without captions. | small | built in |
 | `.mp4` (H.264) | H.264 video + AAC audio, for sharing, phones, Plex/Jellyfin | ~1–1.5 GB/h | ffmpeg |
 | `.mov` (H.264) | the same, in a QuickTime file | ~1–1.5 GB/h | ffmpeg |
 
@@ -285,7 +297,9 @@ olddv tape.dv --mov tape.mov
 * `-m`: merge takes, picking the best blocks of each.
 * `--split`: write one file per recording.
 * `--mov`: lossless QuickTime rewrap (audio error codes repaired).
+* `--mkv`: the same as a Matroska file.
 * `--wav`: the repaired audio as a `.wav` file.
+* `--scc`, `--srt`, `--vtt`: closed captions; `--cc-field 2` for the second field.
 
 `olddv --help` lists all options, including `--csv`.
 
@@ -331,11 +345,13 @@ messages in the Capture log, or in Console.app, say what went wrong.
 
 ```
 src/core/      portable C: DV analysis (dvanalyze.c), XML/CSV report (dvreport.c),
-               merge (dvmerge.c), packager (dvsplit.c), lossless .mov writer (dvmov.c),
-               buffered writer for slow/network disks (dvwriter.c)
+               merge (dvmerge.c), packager (dvsplit.c), lossless .mov and .mkv writers
+               (dvmov.c, dvmkv.c), closed captions (dvcc.c), buffered writer and background
+               copy for slow/network disks (dvwriter.c, dvmirror.c)
 src/cli/       olddv command line tool
 src/mac/       Cocoa app: OVApp (window), OVEngine (capture + retries), OVCapture
-               (QTKit / AVFoundation), OVDeck (AV/C control), OVViews (graph, block map)
+               (QTKit / AVFoundation), OVDeck (AV/C control), OVViews (timeline, block map, picture with
+               error marks), OVPlayer (player window)
 tests/         damage injector, comparison with DVRescue, self test
 tools/         cross build, icon
 dist/          prebuilt app (zip)

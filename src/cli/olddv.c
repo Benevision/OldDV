@@ -28,6 +28,11 @@ static void usage(void)
         "      --mov FILE          rewrap the input into a QuickTime .mov\n"
         "                          (DV video untouched + PCM audio, lossless)\n"
         "                          audio error codes are repaired by interpolation\n"
+        "      --mkv FILE          the same as a Matroska .mkv\n"
+        "      --scc FILE          closed captions (NTSC) as Scenarist .scc, untouched\n"
+        "      --srt FILE          closed captions as SubRip text\n"
+        "      --vtt FILE          closed captions as WebVTT text\n"
+        "      --cc-field N        captions of field 1 (default) or 2\n"
         "      --wav FILE          write the (repaired) audio as a .wav file\n"
         "      --no-audio-repair   keep unreadable audio samples as silence\n"
            "      --copy-to FILE      copy the input to FILE, waiting and retrying when\n"
@@ -64,7 +69,8 @@ int main(int argc, char **argv)
 {
     const char *inputs[64];
     int ninputs = 0, i, ret = 0;
-    const char *wav_out = NULL; int export_flags = 0;
+    const char *wav_out = NULL, *mkv_out = NULL; int export_flags = 0;
+    const char *cc_out[3] = { NULL, NULL, NULL }; int cc_field = 1;
     const char *copy_to = NULL, *copy_until = NULL;
     const char *mov_out = NULL, *xml_out = NULL, *merge_out = NULL, *merge_log = NULL, *split_base = NULL;
     int summary = 0, csv = 0, split_flags = DV_SPLIT_REC_START | DV_SPLIT_FORMAT;
@@ -80,6 +86,11 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--split") && i + 1 < argc) split_base = argv[++i];
         else if (!strcmp(a, "--mov") && i + 1 < argc) mov_out = argv[++i];
         else if (!strcmp(a, "--wav") && i + 1 < argc) wav_out = argv[++i];
+        else if (!strcmp(a, "--mkv") && i + 1 < argc) mkv_out = argv[++i];
+        else if (!strcmp(a, "--scc") && i + 1 < argc) cc_out[DV_CC_SCC] = argv[++i];
+        else if (!strcmp(a, "--srt") && i + 1 < argc) cc_out[DV_CC_SRT] = argv[++i];
+        else if (!strcmp(a, "--vtt") && i + 1 < argc) cc_out[DV_CC_VTT] = argv[++i];
+        else if (!strcmp(a, "--cc-field") && i + 1 < argc) cc_field = atoi(argv[++i]);
         else if (!strcmp(a, "--copy-to") && i + 1 < argc) copy_to = argv[++i];
         else if (!strcmp(a, "--copy-until") && i + 1 < argc) copy_until = argv[++i];
         else if (!strcmp(a, "--no-audio-repair")) export_flags |= DV_EXPORT_NO_CONCEAL;
@@ -154,6 +165,27 @@ int main(int argc, char **argv)
             dv_report_write_summary(stdout, &r);
         dv_report_free(&r);
         return 0;
+    }
+
+    if (cc_out[0] || cc_out[1] || cc_out[2]) {
+        int f, none = 0;
+        for (f = 0; f < 3; f++)
+            if (cc_out[f]) {
+                int r = dv_write_captions(inputs[0], 0, 0, cc_out[f], f, cc_field, log_cb, quiet ? NULL : progress_cb, NULL);
+                if (r < 0) { fprintf(stderr, "Caption export failed\n"); return 1; }
+                none |= r;
+            }
+        if (!mkv_out && !mov_out && !wav_out)
+            return none ? 2 : 0;
+    }
+
+    if (mkv_out) {
+        if (dv_write_mkv(inputs[0], 0, 0, mkv_out, export_flags, log_cb, quiet ? NULL : progress_cb, NULL)) {
+            fprintf(stderr, "Rewrap failed\n");
+            return 1;
+        }
+        if (!mov_out && !wav_out)
+            return 0;
     }
 
     if (mov_out) {

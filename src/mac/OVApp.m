@@ -9,6 +9,7 @@
 #import <QTKit/QTKit.h>
 #import "OVEngine.h"
 #import "OVViews.h"
+#import "OVPlayer.h"
 #include <math.h>
 #include <sys/stat.h>
 #include <sys/param.h>
@@ -198,6 +199,7 @@ static NSString *fmtDuration(uint64_t frames, int pal)
     uint32_t nrows;
     NSString *analysisFile;
     QTMovie *movie;
+    OVPlayer *player;
     BOOL busy;
 
     /* merge tab */
@@ -210,7 +212,7 @@ static NSString *fmtDuration(uint64_t frames, int pal)
 
     /* package tab */
     NSTextField *packInField, *packOutField, *packMinField, *ffmpegField;
-    NSButton *packSplit, *packRec, *packFormat, *packTC, *packKeepDV, *packMovDV, *packMP4, *packMovH264;
+    NSButton *packSplit, *packRec, *packFormat, *packTC, *packKeepDV, *packMovDV, *packMP4, *packMovH264, *packMKV, *packCC;
     NSButton *packDeint, *packSquare, *packButton;
     NSPopUpButton *packQuality, *afterPopup;
     BOOL wasRunning;
@@ -692,13 +694,14 @@ static BOOL OVFolderIsRemote(NSString *folder)
     b = mkButton(v, NSMakeRect(8, H - 40, 120, 32), @"Open DV...", self, @selector(openForAnalysis:));
     b = mkButton(v, NSMakeRect(128, H - 40, 130, 32), @"Save XML...", self, @selector(saveXML:));
     b = mkButton(v, NSMakeRect(258, H - 40, 120, 32), @"Save CSV...", self, @selector(saveCSV:));
-    b = mkButton(v, NSMakeRect(378, H - 40, 120, 32), @"Play in QuickTime", self, @selector(playFile:));
+    b = mkButton(v, NSMakeRect(378, H - 40, 150, 32), @"Play with Errors", self, @selector(playWithErrors:));
+    b = mkButton(v, NSMakeRect(528, H - 40, 150, 32), @"Play in QuickTime", self, @selector(playFile:));
     (void)b;
-    analyzeProgress = [[[NSProgressIndicator alloc] initWithFrame:NSMakeRect(508, H - 32, 160, 16)] autorelease];
+    analyzeProgress = [[[NSProgressIndicator alloc] initWithFrame:NSMakeRect(688, H - 32, 120, 16)] autorelease];
     [analyzeProgress setIndeterminate:NO];
     [analyzeProgress setHidden:YES];
     [v addSubview:analyzeProgress];
-    analyzePath = mkLabel(v, NSMakeRect(676, H - 32, W - 688, 18), @"Open a .dv file to see its errors");
+    analyzePath = mkLabel(v, NSMakeRect(816, H - 32, W - 828, 18), @"Open a .dv file to see its errors");
     [[analyzePath cell] setLineBreakMode:NSLineBreakByTruncatingMiddle];
 
     analyzeGraph = [[OVGraphView alloc] initWithFrame:NSMakeRect(12, H - 150, W - 24, 100)];
@@ -792,6 +795,9 @@ static BOOL OVFolderIsRemote(NSString *folder)
     analysisFile = [path copy];
     [movie release];
     movie = nil;
+    [player close];
+    [player release];
+    player = nil;
     free(rows);
     rows = (uint32_t *)malloc((r->count + 1) * sizeof(uint32_t));
     nrows = 0;
@@ -958,6 +964,17 @@ static BOOL OVFolderIsRemote(NSString *folder)
     }
 }
 
+/* the player window, at the frame that is selected */
+- (void)playWithErrors:(id)s
+{
+    long sel = [analyzeGraph selected];
+    if (!analysis || !analysisFile || !analysis->count) { NSBeep(); return; }
+    if (!player)
+        player = [[OVPlayer alloc] initWithFile:analysisFile report:analysis];
+    if (!player) { NSBeep(); return; }
+    [player showAtFrame:sel >= 0 ? (uint32_t)sel : 0];
+}
+
 - (void)playFile:(id)s
 {
     if (analysisFile)
@@ -1096,6 +1113,8 @@ static BOOL OVFolderIsRemote(NSString *folder)
     y -= 24;
     packMP4 = mkCheck(v, NSMakeRect(110, y, 200, 20), @".mp4 - H.264 + AAC", [defs boolForKey:@"exp_mp4"]);
     packMovH264 = mkCheck(v, NSMakeRect(320, y, 330, 20), @".mov - H.264 + AAC", [defs boolForKey:@"exp_movh264"]);
+    packMKV = mkCheck(v, NSMakeRect(660, y + 24, 320, 20), @".mkv - DV + PCM, lossless (built in)", [defs boolForKey:@"exp_mkv"]);
+    packCC = mkCheck(v, NSMakeRect(660, y, 320, 20), @"Closed captions (.scc, .srt, .vtt)", [defs boolForKey:@"exp_cc"]);
     y -= 30;
     mkLabel(v, NSMakeRect(12, y, 95, 18), @"H.264:");
     packQuality = mkPopup(v, NSMakeRect(106, y - 4, 210, 26), [NSArray arrayWithObjects:
@@ -1117,6 +1136,8 @@ static BOOL OVFolderIsRemote(NSString *folder)
     appendText(packLog, @"Split a capture into one file per recording and/or convert it.");
     appendText(packLog, @"  .dv         raw DV, keep it as the archival master");
     appendText(packLog, @"  .mov (DV)   same DV video untouched + PCM audio, plays everywhere QuickTime does (13 GB/hour)");
+    appendText(packLog, @"  .mkv        the same in a Matroska file");
+    appendText(packLog, @"  captions    closed captions of NTSC tapes recorded from television: .scc (untouched), .srt and .vtt (text)");
     appendText(packLog, @"  .mp4/.mov H.264   small files for sharing / Plex (about 1-1.5 GB/hour), needs the ffmpeg encoder");
     {
         NSString *enc = [self ffmpegPath];
@@ -1220,6 +1241,8 @@ static BOOL OVFolderIsRemote(NSString *folder)
     [defs setBool:[packMovDV state] == NSOnState forKey:@"exp_movdv"];
     [defs setBool:[packMP4 state] == NSOnState forKey:@"exp_mp4"];
     [defs setBool:[packMovH264 state] == NSOnState forKey:@"exp_movh264"];
+    [defs setBool:[packMKV state] == NSOnState forKey:@"exp_mkv"];
+    [defs setBool:[packCC state] == NSOnState forKey:@"exp_cc"];
     if ([[ffmpegField stringValue] length])
         [defs setObject:[ffmpegField stringValue] forKey:@"ffmpeg"];
     o = [self exportOptions];
@@ -1230,7 +1253,8 @@ static BOOL OVFolderIsRemote(NSString *folder)
                         @"install it with MacPorts (sudo port install ffmpeg +gpl2), or choose an ffmpeg binary.", @"OK", nil, nil);
         return;
     }
-    if ([packSplit state] != NSOnState && [packKeepDV state] == NSOnState && !h264 && [packMovDV state] != NSOnState) {
+    if ([packSplit state] != NSOnState && [packKeepDV state] == NSOnState && !h264 && [packMovDV state] != NSOnState
+        && [packMKV state] != NSOnState && [packCC state] != NSOnState) {
         NSRunAlertPanel(@"Package & Export", @"Nothing to do: tick Split or choose an output format.", @"OK", nil, nil);
         return;
     }
@@ -1242,6 +1266,8 @@ static BOOL OVFolderIsRemote(NSString *folder)
     [o setObject:[NSNumber numberWithBool:[packKeepDV state] == NSOnState] forKey:@"keepdv"];
     [o setObject:[NSNumber numberWithBool:[packMovDV state] == NSOnState] forKey:@"movdv"];
     [o setObject:[NSNumber numberWithBool:[packMP4 state] == NSOnState] forKey:@"mp4"];
+    [o setObject:[NSNumber numberWithBool:[packMKV state] == NSOnState] forKey:@"mkv"];
+    [o setObject:[NSNumber numberWithBool:[packCC state] == NSOnState] forKey:@"cc"];
     [o setObject:[NSNumber numberWithBool:[packMovH264 state] == NSOnState] forKey:@"movh264"];
     [self startExport:o];
 }
@@ -1349,6 +1375,33 @@ static BOOL OVFolderIsRemote(NSString *folder)
                 failed++;
                 log_to_main(self, [[NSString stringWithFormat:@"  %@ FAILED", [mov lastPathComponent]] UTF8String]);
             }
+        }
+        if ([[o objectForKey:@"mkv"] boolValue]) {
+            NSString *mkv = [b stringByAppendingPathExtension:@"mkv"];
+            if (dv_write_mkv([dv fileSystemRepresentation], 0, 0, [mkv fileSystemRepresentation], 0, log_to_main, NULL, self) == 0)
+                ok++;
+            else {
+                failed++;
+                log_to_main(self, [[NSString stringWithFormat:@"  %@ FAILED", [mkv lastPathComponent]] UTF8String]);
+            }
+        }
+        if ([[o objectForKey:@"cc"] boolValue]) {
+            /* field 1 (CC1) and, when it has captions too, field 2 (CC3) */
+            static const char *ext[3] = { "scc", "srt", "vtt" };
+            int field, f;
+            for (field = 1; field <= 2; field++)
+                for (f = 0; f < 3; f++) {
+                    NSString *cc = [NSString stringWithFormat:@"%@%s.%s", b, field == 2 ? ".field2" : "", ext[f]];
+                    int r = dv_write_captions([dv fileSystemRepresentation], 0, 0, [cc fileSystemRepresentation], f, field,
+                                              field == 1 && f == 0 ? log_to_main : NULL, NULL, self);
+                    if (r == 0) {
+                        ok++;
+                        log_to_main(self, [[NSString stringWithFormat:@"  %@", [cc lastPathComponent]] UTF8String]);
+                    } else if (r < 0)
+                        failed++;
+                    else
+                        break; /* no captions in this field */
+                }
         }
         if (mp4) {
             NSString *out = [b stringByAppendingPathExtension:@"mp4"];

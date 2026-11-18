@@ -52,6 +52,26 @@ a2=$(ffmpeg -v error -i "$W/clean.mov" -map 0:a:0 -f s16le - | md5sum)
 check ".mov rewrap keeps DV video bit-exact" "[ \"$v1\" = \"$v2\" ]"
 check ".mov rewrap audio identical to ffmpeg's DV decode" "[ \"$a1\" = \"$a2\" ]"
 
+# lossless Matroska rewrap: same video frames, same audio as the .mov
+"$OLDDV" "$W/clean.dv" --mkv "$W/clean.mkv" 2>/dev/null
+v3=$(ffmpeg -v error -i "$W/clean.mkv" -map 0:v -f framemd5 - | grep -v '^#' | awk -F, '{print $6}' | md5sum)
+a5=$(ffmpeg -v error -i "$W/clean.mkv" -map 0:a:0 -f s16le - | md5sum)
+check ".mkv rewrap keeps DV video bit-exact" "[ \"$v1\" = \"$v3\" ]"
+check ".mkv rewrap audio identical to the .mov" "[ \"$a2\" = \"$a5\" ]"
+check ".mkv can be seeked (cues)" "ffmpeg -v error -ss 4 -i $W/clean.mkv -frames:v 1 -f null - 2>&1 | wc -c | grep -q '^ *0$'"
+
+# closed captions: pop-on captions in field 1, roll-up in field 2
+python3 tests/ccinject.py "$W/clean.dv" "$W/cc.dv"
+"$OLDDV" "$W/cc.dv" --scc "$W/cc.scc" --srt "$W/cc.srt" --vtt "$W/cc.vtt" 2>/dev/null
+"$OLDDV" "$W/cc.dv" --cc-field 2 --srt "$W/cc2.srt" 2>/dev/null
+check "captions: .scc has the raw data" "grep -q '^00:00:00;20.9420 9420 94ae 94ae 9440 9440 c845 4c4c' $W/cc.scc"
+check "captions: pop-on text and timing in .srt" "grep -A2 '00:00:01,335 --> 00:00:02,669' $W/cc.srt | tr '\n' '|' | grep -q 'HELLO THERE|SECOND LINE'"
+check "captions: extended character" "grep -q 'CAFÉ' $W/cc.srt"
+check "captions: WebVTT" "head -1 $W/cc.vtt | grep -q WEBVTT && grep -q '00:00:01.335 --> 00:00:02.669' $W/cc.vtt"
+check "captions: roll-up in field 2" "grep -A2 ' --> 00:00:04,004' $W/cc2.srt | tr '\n' '|' | grep -q 'ROLL ONE|ROLL TWO'"
+if "$OLDDV" "$W/clean.dv" --srt "$W/none.srt" 2>/dev/null; then nocc=0; else nocc=1; fi
+check "captions: a file without captions gives no .srt" "[ $nocc = 1 ] && [ ! -e $W/none.srt ]"
+
 # merge of a tape whose time code restarts (same time codes twice): the
 # first take is the timeline, nothing may be lost or reordered
 python3 tests/inject.py "$W/two.dv" "$W/two_a.dv" 5

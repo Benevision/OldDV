@@ -543,3 +543,144 @@ static void draw_tag(NSString *s, CGFloat x, CGFloat y, CGFloat w, BOOL leftOf, 
         }
 }
 @end
+
+/* ------------------------------------------------------------------ */
+
+@implementation OVPictureView
+
+- (id)initWithFrame:(NSRect)r
+{
+    self = [super initWithFrame:r];
+    if (self)
+        showErrors = YES;
+    return self;
+}
+
+- (void)dealloc
+{
+    [image release];
+    [caption release];
+    free(rects);
+    [super dealloc];
+}
+
+- (BOOL)isOpaque { return YES; }
+- (BOOL)isFlipped { return NO; }
+- (size_t)markCount { return nrects; }
+
+- (void)setShowErrors:(BOOL)on
+{
+    showErrors = on;
+    [self setNeedsDisplay:YES];
+}
+
+- (void)clear
+{
+    [image release];
+    image = nil;
+    [caption release];
+    caption = nil;
+    nrects = 0;
+    picH = 0;
+    [self setNeedsDisplay:YES];
+}
+
+- (void)setImage:(NSImage *)img frameData:(const uint8_t *)data size:(size_t)size bitDepth:(int)bits
+            wide:(BOOL)w caption:(NSString *)c
+{
+    size_t nb = size / DV_BLOCK_SIZE, nseq = size / 12000, seq, b;
+    uint8_t *st = (uint8_t *)malloc(nb ? nb : 1);
+    uint16_t *r;
+    int dsf = size >= 144000;
+    [img retain];
+    [image release];
+    image = img;
+    [caption release];
+    caption = [c copy];
+    wideShape = w;
+    picH = data && nseq ? (dsf ? 576 : 480) : 0;
+    nrects = 0;
+    audioErrors = 0;
+    free(rects);
+    rects = (uint8_t *)malloc((nseq * 135 + 1) * 4 * sizeof(uint16_t));
+    r = (uint16_t *)rects;
+    if (st && rects && data && nseq) {
+        dv_block_status(data, size, bits == 12 ? 1 : (bits == 16 ? 0 : -1), st);
+        for (seq = 0; seq < nseq; seq++) {
+            int v = 0;
+            for (b = 0; b < 150; b++) {
+                size_t i = seq * 150 + b;
+                int type = data[i * DV_BLOCK_SIZE] >> 5;
+                if (type == 3 && st[i] == DV_BS_NOK)
+                    audioErrors++;
+                if (type != 4)
+                    continue;
+                if (st[i] == DV_BS_NOK && v < 135) {
+                    int x, y, bw, bh;
+                    dv_video_block_rect(dsf, (int)seq, v, &x, &y, &bw, &bh);
+                    r[nrects * 4] = (uint16_t)x;
+                    r[nrects * 4 + 1] = (uint16_t)y;
+                    r[nrects * 4 + 2] = (uint16_t)bw;
+                    r[nrects * 4 + 3] = (uint16_t)bh;
+                    nrects++;
+                }
+                v++;
+            }
+        }
+    }
+    free(st);
+    [self setNeedsDisplay:YES];
+}
+
+- (void)drawRect:(NSRect)dirty
+{
+    NSRect b = [self bounds], p;
+    CGFloat ar = wideShape ? 16.0 / 9.0 : 4.0 / 3.0;
+    [[NSColor blackColor] set];
+    NSRectFill(b);
+    if (!picH && !image)
+        return;
+    /* the picture, as large as fits, in its display shape */
+    p.size.width = b.size.width;
+    p.size.height = (CGFloat)floor(b.size.width / ar);
+    if (p.size.height > b.size.height) {
+        p.size.height = b.size.height;
+        p.size.width = (CGFloat)floor(b.size.height * ar);
+    }
+    p.origin.x = (CGFloat)floor((b.size.width - p.size.width) / 2);
+    p.origin.y = (CGFloat)floor((b.size.height - p.size.height) / 2);
+    if (image)
+        [image drawInRect:p fromRect:NSZeroRect operation:NSCompositeCopy fraction:1.0];
+    else {
+        [[NSColor colorWithCalibratedWhite:0.18 alpha:1] set];
+        NSRectFill(p);
+    }
+    if (showErrors && picH && nrects) {
+        const uint16_t *r = (const uint16_t *)rects;
+        CGFloat sx = p.size.width / 720.0, sy = p.size.height / (CGFloat)picH;
+        size_t i;
+        [[NSColor colorWithCalibratedRed:1 green:0.1 blue:0.1 alpha:0.5] set];
+        for (i = 0; i < nrects; i++) {
+            NSRect q = NSMakeRect(p.origin.x + r[i * 4] * sx,
+                                  p.origin.y + p.size.height - (r[i * 4 + 1] + r[i * 4 + 3]) * sy,
+                                  r[i * 4 + 2] * sx, r[i * 4 + 3] * sy);
+            NSRectFillUsingOperation(q, NSCompositeSourceOver);
+        }
+    }
+    if (showErrors && audioErrors) {
+        /* audio errors have no place in the picture: a bar along the bottom */
+        [[NSColor colorWithCalibratedRed:1 green:0.6 blue:0.1 alpha:0.9] set];
+        NSRectFillUsingOperation(NSMakeRect(p.origin.x, p.origin.y, p.size.width, 4), NSCompositeSourceOver);
+    }
+    if (caption) {
+        NSDictionary *a = [NSDictionary dictionaryWithObjectsAndKeys:
+                           [NSColor whiteColor], NSForegroundColorAttributeName,
+                           [NSFont userFixedPitchFontOfSize:11], NSFontAttributeName, nil];
+        NSSize sz = [caption sizeWithAttributes:a];
+        [[NSColor colorWithCalibratedWhite:0 alpha:0.65] set];
+        NSRectFillUsingOperation(NSMakeRect(p.origin.x, p.origin.y + p.size.height - sz.height - 2, sz.width + 8, sz.height + 2),
+                                 NSCompositeSourceOver);
+        [caption drawAtPoint:NSMakePoint(p.origin.x + 4, p.origin.y + p.size.height - sz.height - 1) withAttributes:a];
+    }
+}
+@end
