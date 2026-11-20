@@ -123,6 +123,12 @@ typedef struct OVLiveStats {
     NSString *baseName;     /* full path without .dv */
     int retryCount;
     BOOL mergeLater;        /* leave the takes unmerged, write NAME.olddv */
+    NSView *previewView;    /* where the backend shows the live picture */
+    double connectTime;     /* when the capture connection was (re)started */
+    double lastRestart;
+    int restartsWithoutData;/* connection restarts since data last arrived */
+    BOOL restartAdvised;
+    BOOL recovering;        /* finishing a session that was interrupted */
     double noDataTimeout;
     BOOL blankLogged;
     NSString *destFolder;   /* nil: record straight into the chosen folder */
@@ -157,6 +163,16 @@ typedef struct OVLiveStats {
  * list NAME.olddv is written, to merge them later, here or on another
  * machine. Call before -startRecordingTo:. */
 - (void)setMergeLater:(BOOL)later;
+/* Session journal: NAME.session next to the recording says what the
+ * capture was doing, so that it can be finished after a crash or a power
+ * cut. It is removed when the session ends normally. */
++ (NSDictionary *)readSession:(NSString *)sessionFile;  /* name, dest, phase...; nil: not a session file */
+/* Finishes an interrupted session from the files that are on the disk:
+ * reports, merge (or the list for a later merge), copy to its folder.
+ * Nothing can be read from the tape again. NO when the engine is busy. */
+- (BOOL)recoverSession:(NSString *)sessionFile;
+/* stops and starts the capture connection (main thread) */
+- (void)restartCapture:(NSString *)why;
 - (BOOL)startRecordingTo:(NSString *)basePath retries:(int)retries noDataTimeout:(double)seconds
                 playDeck:(BOOL)play error:(NSString **)err;
 - (void)stopRecording;          /* user stop (also cancels retries) */

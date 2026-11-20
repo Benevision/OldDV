@@ -53,7 +53,7 @@ for f in src/core/dvanalyze.c src/core/dvreport.c src/core/dvmerge.c src/core/dv
   OBJS="$OBJS $o"
 done
 APPOBJS=""
-for f in OVApp OVCapture OVDeck OVEngine OVViews OVPlayer OVMovie; do
+for f in OVApp OVCapture OVDeck OVEngine OVViews OVPlayer OVMovie OVShare; do
   $CC $CFLAGS -fobjc-exceptions -c "src/mac/$f.m" -o "$OUT/obj/$f.o"
   APPOBJS="$APPOBJS $OUT/obj/$f.o"
 done

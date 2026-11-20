@@ -77,6 +77,7 @@ static void frame_cb(void *ctx, const uint8_t *frame, size_t size, int64_t pos)
     [logPath release];
     [destFolder release];
     [resultFolder release];
+    [previewView release];
     dv_mirror_free(mirror);
     pthread_mutex_destroy(&mtx);
     [super dealloc];
@@ -166,6 +167,12 @@ static void append_line(NSString *path, NSString *text)
         return NO;
     }
     deviceID = [uid copy];
+    [previewView release];
+    previewView = [view retain];
+    connectTime = now_s();
+    lastRestart = 0;
+    restartsWithoutData = 0;
+    restartAdvised = NO;
     deck = [[OVDeck deckForDeviceID:uid] retain];
     [self log:[NSString stringWithFormat:@"Connected using %@%@", [backend engineName],
                deck ? [NSString stringWithFormat:@", deck control: %@", [deck name]] : @", no AV/C deck control"]];
@@ -186,6 +193,46 @@ static void append_line(NSString *path, NSString *text)
     deviceID = nil;
     if (state != OVEngineMerging && state != OVEngineRetrying && state != OVEngineCopying)
         state = OVEngineIdle;
+}
+
+/* The DV stream of a camcorder can stop for good after many transport
+ * changes (seen after some 350 wind / play cycles of the re-read passes):
+ * the deck still answers and plays, but no frame arrives any more, in
+ * this session and in the next ones. Stopping and starting the capture
+ * connection is what unplugging the cable would do. Main thread. */
+- (void)restartCaptureOnMain:(NSString *)why
+{
+    NSString *err = nil;
+    if (!backend || !deviceID)
+        return;
+    lastRestart = now_s();
+    restartsWithoutData++;
+    [self log:[NSString stringWithFormat:@"%@: restarting the capture connection (attempt %d).", why, restartsWithoutData]];
+    [backend stop];
+    if (![backend startWithDeviceID:deviceID sink:self preview:previewView error:&err])
+        [self log:[NSString stringWithFormat:@"The capture connection could not be restarted: %@", err ? err : @"unknown error"]];
+    connectTime = now_s();
+    if (restartsWithoutData >= 3 && !restartAdvised) {
+        restartAdvised = YES;
+        [self log:@"Still no data from the device. Switch the camcorder off and on (VCR / Play mode) or re-plug the FireWire cable, "
+                  @"then click Connect."];
+    }
+}
+
+- (void)restartCapture:(NSString *)why
+{
+    [self performSelectorOnMainThread:@selector(restartCaptureOnMain:) withObject:why waitUntilDone:YES];
+}
+
+/* seconds without any byte from the device (since the connection when
+ * none ever came) */
+- (double)secondsWithoutData
+{
+    double t;
+    pthread_mutex_lock(&mtx);
+    t = now_s() - (lastDataTime > connectTime ? lastDataTime : connectTime);
+    pthread_mutex_unlock(&mtx);
+    return t;
 }
 
 /* ------------------------------------------------------------------ */
@@ -424,6 +471,55 @@ static void append_line(NSString *path, NSString *text)
     return r;
 }
 
+/* ------------------------------------------------------------------ */
+/* Session journal                                                     */
+
+- (NSString *)sessionPath { return baseName ? [baseName stringByAppendingPathExtension:@"session"] : nil; }
+
+/* written in one piece and flushed to the disk: it must survive a power cut */
+- (void)writeSession:(NSString *)phase
+{
+    NSString *path = [self sessionPath], *tmp;
+    NSString *text;
+    FILE *f;
+    if (!path)
+        return;
+    text = [NSString stringWithFormat:@"OldDV Rescue session\nversion=1\nname=%@\ndest=%@\nretries=%d\nmerge_later=%d\nphase=%@\n",
+            [baseName lastPathComponent], destFolder ? destFolder : @"", retryCount, mergeLater ? 1 : 0, phase];
+    tmp = [path stringByAppendingString:@".tmp"];
+    f = fopen([tmp fileSystemRepresentation], "w");
+    if (!f)
+        return;
+    fputs([text UTF8String], f);
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    rename([tmp fileSystemRepresentation], [path fileSystemRepresentation]);
+}
+
+- (void)removeSession
+{
+    NSString *path = [self sessionPath];
+    if (path)
+        unlink([path fileSystemRepresentation]);
+}
+
++ (NSDictionary *)readSession:(NSString *)sessionFile
+{
+    NSString *text = [NSString stringWithContentsOfFile:sessionFile encoding:NSUTF8StringEncoding error:NULL];
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    if (!text || ![text hasPrefix:@"OldDV Rescue session"])
+        return nil;
+    for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+        NSRange r = [line rangeOfString:@"="];
+        if (r.location != NSNotFound)
+            [d setObject:[line substringFromIndex:r.location + 1] forKey:[line substringToIndex:r.location]];
+    }
+    if (![[d objectForKey:@"name"] length])
+        return nil;
+    return d;
+}
+
 - (BOOL)startRecordingTo:(NSString *)basePath retries:(int)retries noDataTimeout:(double)seconds
                 playDeck:(BOOL)play error:(NSString **)err
 {
@@ -487,6 +583,9 @@ static void append_line(NSString *path, NSString *text)
     state = OVEngineRecording;
     pthread_mutex_unlock(&mtx);
     [self notifyState];
+    [self writeSession:@"recording"];
+    restartsWithoutData = 0;
+    restartAdvised = NO;
     [self setLogPath:[basePath stringByAppendingPathExtension:@"log"]];
     [self log:[NSString stringWithFormat:@"OldDV Rescue %s on %@, capture engine: %@, deck control: %@",
                OLDDV_VERSION, [[NSProcessInfo processInfo] operatingSystemVersionString], [self engineName],
@@ -531,6 +630,7 @@ static void append_line(NSString *path, NSString *text)
         if (!deck) {
             [self log:@"Retry of bad sections skipped: the device has no AV/C deck control."];
         } else {
+            [self writeSession:@"rereading"];
             [self setState:OVEngineRetrying];
             /* the deck is passed so that NSThread keeps it retained while the
              * worker uses it, even if -disconnect releases the ivar */
@@ -636,9 +736,11 @@ static int copy_cancel_cb(void *ctx, double f)
     /* the main file first (its copy is already under way), the log last */
     [names addObject:mainName];
     for (NSString *n in [[fm contentsOfDirectoryAtPath:localDir error:NULL] sortedArrayUsingSelector:@selector(compare:)])
-        if ([n hasPrefix:prefix] && ![n isEqualToString:mainName] && ![n isEqualToString:logName])
+        if ([n hasPrefix:prefix] && ![n isEqualToString:mainName] && ![n isEqualToString:logName]
+            && ![n hasSuffix:@".session"] && ![n hasSuffix:@".session.tmp"])
             [names addObject:n];
     [names addObject:logName];
+    [self writeSession:@"copying"];
     [self log:[NSString stringWithFormat:@"Copying the capture to %@ and checking the copy...", destFolder]];
     pthread_mutex_lock(&mtx);
     m = mirror;
@@ -652,7 +754,8 @@ static int copy_cancel_cb(void *ctx, double f)
             dispatch_sync(logQueue, ^{ [logPath release]; logPath = nil; });
         }
         if (![fm fileExistsAtPath:src]) {
-            if (n == mainName) ok = NO;
+            /* gone from this Mac: fine only if an earlier, interrupted run already moved it */
+            if (n == mainName && ![fm fileExistsAtPath:dst]) ok = NO;
             dv_mirror_free(m);
             m = NULL;
             if (!ok) break;
@@ -675,14 +778,16 @@ static int copy_cancel_cb(void *ctx, double f)
         [resultFolder release];
         resultFolder = [destFolder copy];
         [self setLogPath:[destFolder stringByAppendingPathComponent:logName]];
+        [self removeSession];
         [self log:@"The recording on this Mac was removed after the check."];
     } else {
         [self setLogPath:[localDir stringByAppendingPathComponent:logName]];
         [self log:[NSString stringWithFormat:@"The capture was NOT copied completely to %@ (%@). It is complete and safe on this Mac in %@. "
-                   @"Copy the files named %@* from there when the folder works again.",
-                   destFolder, cancelCopy ? @"stopped" : @"the folder failed", localDir, prefix]];
+                   @"When the folder works again, start OldDV Rescue: it offers to finish the copy.",
+                   destFolder, cancelCopy ? @"stopped" : @"the folder failed", localDir]];
     }
-    [self log:@"Capture finished."];
+    [self log:recovering ? @"Recovery finished." : @"Capture finished."];
+    recovering = NO;
     [self setState:backend ? OVEngineMonitoring : OVEngineIdle];
     [pool release];
 }
@@ -695,7 +800,9 @@ static int copy_cancel_cb(void *ctx, double f)
         [NSThread detachNewThreadSelector:@selector(copyMain:) toTarget:self withObject:nil];
         return;
     }
-    [self log:@"Capture finished."];
+    [self removeSession];
+    [self log:recovering ? @"Recovery finished." : @"Capture finished."];
+    recovering = NO;
     [self setState:backend ? OVEngineMonitoring : OVEngineIdle];
 }
 
@@ -716,13 +823,26 @@ static int copy_cancel_cb(void *ctx, double f)
         lastDeckPoll = t;
         dispatch_async(deckQueue, ^{
             int st = (int)[d state];
-            if (st != deckStateCache && state != OVEngineIdle && state != OVEngineMonitoring)
+            /* "unknown" comes between two states at every change: not worth a line */
+            if (st != deckStateCache && st != OVDeckUnknown && state != OVEngineIdle && state != OVEngineMonitoring)
                 [self log:[NSString stringWithFormat:@"Deck: %@", [OVDeck describeState:(OVDeckState)st]]];
             deckStateCache = st;
         });
     }
+    /* the deck plays but no data arrives: the capture connection is dead */
+    if (backend && deck && (state == OVEngineMonitoring || state == OVEngineRecording || state == OVEngineRetrying)) {
+        double quiet = [self secondsWithoutData];
+        if (quiet < 2) {
+            restartsWithoutData = 0;
+            restartAdvised = NO;
+        } else if (deckStateCache == OVDeckPlaying && quiet > 8 && t - lastRestart > (restartsWithoutData < 3 ? 20 : 120))
+            [self restartCaptureOnMain:[NSString stringWithFormat:@"The deck plays but no data came for %.0f seconds", quiet]];
+    }
     if (state == OVEngineRecording) {
         OVLiveStats s = [self stats];
+        /* a connection that is being restarted is not the end of the tape */
+        BOOL reviving = deck && deckStateCache == OVDeckPlaying && s.secondsSinceData < 90
+            && (restartsWithoutData < 3 || t - lastRestart < 20);
         /* Blank sections and a progress line every 5 minutes go to the log:
          * after a crash or a power cut the log shows how far the capture got. */
         if (!blankLogged && s.secondsSinceSignal > 10) {
@@ -750,6 +870,8 @@ static int copy_cancel_cb(void *ctx, double f)
             [self log:@"Write error (disk full, or network share disconnected?): capture stopped."];
             cancel = YES;
             [self finishPass1];
+        } else if (reviving && s.secondsSinceData > noDataTimeout) {
+            /* wait for the restart */
         } else if (noDataTimeout > 0 && s.framesRecorded > 0 && s.secondsSinceData > noDataTimeout) {
             [self log:[NSString stringWithFormat:@"No data from the device for %.0f seconds (end of tape?): finishing.", noDataTimeout]];
             [self finishPass1];
@@ -887,10 +1009,21 @@ static int copy_cancel_cb(void *ctx, double f)
         [deck play];
         for (t0 = now_s(); now_s() - t0 < 4 && pos < 0 && !cancel; usleep(100000))
             pos = [self liveTC:0.5];
-        [deck pause];
+        if (pos < 0 && !cancel && [self secondsWithoutData] > 3 && now_s() - lastRestart > 20) {
+            /* nothing comes from the device at all: restart the connection, once */
+            [self restartCapture:@"No data from the device while the deck plays"];
+            [deck play];
+            for (t0 = now_s(); now_s() - t0 < 12 && pos < 0 && !cancel; usleep(100000))
+                pos = [self liveTC:0.5];
+        }
+        if (pos >= 0)
+            [deck pause];
+        else
+            [deck stop]; /* never leave the tape held on the drum */
     }
     if (pos < 0) {
-        [self log:@"  Cannot read the tape position (no time code)."];
+        [self log:[self secondsWithoutData] > 3 ? @"  Cannot read the tape position: no data from the device."
+                                                : @"  Cannot read the tape position (no time code)."];
         return 0;
     }
     [self setHeadTC:pos];
@@ -951,12 +1084,140 @@ static int copy_cancel_cb(void *ctx, double f)
     return NO;
 }
 
+/* After the last re-read: merge the takes, or list them for a later merge */
+- (void)mergeTakes
+{
+    if ([takes count] > 1 && mergeLater) {
+        const char *in[64];
+        int n = 0;
+        for (NSString *t in takes)
+            if (n < 64)
+                in[n++] = [t fileSystemRepresentation];
+        if (dv_capture_write_list([baseName fileSystemRepresentation], in, n) == 0)
+            [self log:[NSString stringWithFormat:@"The %d takes are NOT merged yet, as chosen. To merge them, on this Mac or another one: "
+                       @"Merge Takes > Open Capture... and choose %@.olddv (it lists the takes; keep all the files together).",
+                       n, [baseName lastPathComponent]]];
+        else
+            [self log:[NSString stringWithFormat:@"The %d takes are not merged, and the list %@.olddv could not be written. "
+                       @"Merge Takes > Open Capture... also accepts %@.dv.", n, [baseName lastPathComponent], [baseName lastPathComponent]]];
+    } else if ([takes count] > 1) {
+        NSString *merged = [baseName stringByAppendingString:@".merged.dv"];
+        const char *in[64];
+        int n = 0;
+        dv_merge_stats ms;
+        [self writeSession:@"merging"];
+        [self setState:OVEngineMerging];
+        [self log:[NSString stringWithFormat:@"Merging %lu takes into %@ ...", (unsigned long)[takes count], [merged lastPathComponent]]];
+        for (NSString *t in takes)
+            if (n < 64)
+                in[n++] = [t fileSystemRepresentation];
+        if (dv_merge_files(in, n, [merged fileSystemRepresentation], &ms, NULL, NULL, NULL) == 0) {
+            dv_report mr;
+            dv_report_init(&mr, [merged fileSystemRepresentation]);
+            dv_analyze_file([merged fileSystemRepresentation], &mr, NULL, NULL);
+            dv_report_save_xml([[merged stringByAppendingString:@".dvrescue.xml"] fileSystemRepresentation], &mr);
+            [self log:[NSString stringWithFormat:@"Merged: %u frames: %u without errors in one of the takes, %u repaired by mixing "
+                       @"blocks of several takes (%u blocks), %u still with errors.",
+                       ms.frames_out, ms.frames_ok, ms.frames_repaired, ms.blocks_fixed, ms.frames_still_bad]];
+            dv_report_free(&mr);
+        } else
+            [self log:@"Merge failed."];
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Recovery of an interrupted session                                  */
+
+- (void)recoverMain:(NSDictionary *)info
+{
+    NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+    NSString *phase = [info objectForKey:@"phase"];
+    NSString *mainPath = [baseName stringByAppendingPathExtension:@"dv"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    dv_capture_set set;
+    int i;
+    [self log:[NSString stringWithFormat:@"OldDV Rescue %s: finishing the capture %@, which was interrupted while %@ "
+               @"(power cut, crash or quit). Only the files on the disk are used; nothing is read from the tape.",
+               OLDDV_VERSION, [baseName lastPathComponent], phase ? phase : @"running"]];
+    [takes removeAllObjects];
+    if (dv_capture_open([mainPath fileSystemRepresentation], &set) == 0) {
+        for (i = 0; i < set.ntakes; i++)
+            [takes addObject:[fm stringWithFileSystemRepresentation:set.takes[i] length:strlen(set.takes[i])]];
+        dv_capture_free(&set);
+    } else
+        [self log:[NSString stringWithFormat:@"%@ holds no complete frame: nothing was recorded before the interruption.",
+                   [mainPath lastPathComponent]]];
+    /* the reports that were not written */
+    for (NSString *t in takes) {
+        NSString *xml = [t stringByAppendingString:@".dvrescue.xml"];
+        dv_report r;
+        char tc[16] = "";
+        if ([fm fileExistsAtPath:xml])
+            continue;
+        dv_report_init(&r, [t fileSystemRepresentation]);
+        if (dv_analyze_file([t fileSystemRepresentation], &r, NULL, NULL) < 0) {
+            [self log:[NSString stringWithFormat:@"Cannot read %@", [t lastPathComponent]]];
+            dv_report_free(&r);
+            continue;
+        }
+        if (r.count)
+            dv_format_tc(tc, &r.frames[r.count - 1]);
+        dv_report_save_xml([xml fileSystemRepresentation], &r);
+        [self log:[NSString stringWithFormat:@"%@: %u frames, %u with issues, the last one at time code %s. Report written.",
+                   [t lastPathComponent], r.count, r.frames_with_errors, tc[0] ? tc : "--"]];
+        dv_report_free(&r);
+    }
+    if ([takes count] == 1 && [phase isEqualToString:@"recording"])
+        [self log:@"The tape was not captured to its end. To get the rest, wind the tape back a little before the place above "
+                  @"and capture it under another name; Merge Takes can then join both captures."];
+    /* a merge that was under way is made again from its start */
+    if ([takes count] > 1 && ![phase isEqualToString:@"copying"])
+        [self mergeTakes];
+    [self finishSession];
+    [pool release];
+}
+
+- (BOOL)recoverSession:(NSString *)sessionFile
+{
+    NSDictionary *info = [OVEngine readSession:sessionFile];
+    NSString *dest;
+    if (!info || (state != OVEngineIdle && state != OVEngineMonitoring))
+        return NO;
+    dest = [info objectForKey:@"dest"];
+    [baseName release];
+    baseName = [[[sessionFile stringByDeletingLastPathComponent] stringByAppendingPathComponent:[info objectForKey:@"name"]] copy];
+    [destFolder release];
+    destFolder = [dest length] ? [dest copy] : nil;
+    [resultFolder release];
+    resultFolder = [[baseName stringByDeletingLastPathComponent] copy];
+    retryCount = [[info objectForKey:@"retries"] intValue];
+    mergeLater = [[info objectForKey:@"merge_later"] intValue] != 0;
+    cancel = NO;
+    cancelCopy = NO;
+    mirrorFailing = NO;
+    recovering = YES;
+    pthread_mutex_lock(&mtx);
+    dv_mirror_free(mirror);
+    mirror = NULL;
+    npoints = 0;
+    nsections = 0;
+    plannedRetries = 0;
+    graphRev++;
+    pthread_mutex_unlock(&mtx);
+    [self setLogPath:[baseName stringByAppendingPathExtension:@"log"]];
+    [self setState:OVEngineMerging];
+    [NSThread detachNewThreadSelector:@selector(recoverMain:) toTarget:self withObject:info];
+    return YES;
+}
+
 - (void)retryMain:(id)unused
 {
     NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
     int pass;
     int fps = [self fps];
-    for (pass = 1; pass <= retryCount && !cancel; pass++) {
+    int failStreak = 0;
+    BOOL giveUp = NO;
+    for (pass = 1; pass <= retryCount && !cancel && !giveUp; pass++) {
         NSMutableArray *ranges = [NSMutableArray array];
         NSString *path;
         NSString *err = nil;
@@ -1010,8 +1271,17 @@ static int copy_cancel_cb(void *ctx, double f)
             if (![self seekTo:a - 3 * fps]) {
                 [self log:@"  Seek failed, section skipped."];
                 [self setSection:sec state:OVSectionSkipped];
+                if (++failStreak >= 4 && !cancel) {
+                    /* going on would wind the tape for nothing, section after section */
+                    [self log:[NSString stringWithFormat:@"%d sections in a row could not be reached: the re-reads end here. "
+                               @"What was read so far is kept.%@", failStreak, [self secondsWithoutData] > 3
+                               ? @" The device sends no data: switch the camcorder off and on, then click Connect." : @""]];
+                    giveUp = YES;
+                    break;
+                }
                 continue;
             }
+            failStreak = 0;
             [self setSection:sec state:OVSectionReading];
             pthread_mutex_lock(&mtx);
             winStart = a - fps;
@@ -1096,41 +1366,7 @@ static int copy_cancel_cb(void *ctx, double f)
         graphRev++;
     }
     pthread_mutex_unlock(&mtx);
-    if ([takes count] > 1 && mergeLater) {
-        const char *in[64];
-        int n = 0;
-        for (NSString *t in takes)
-            if (n < 64)
-                in[n++] = [t fileSystemRepresentation];
-        if (dv_capture_write_list([baseName fileSystemRepresentation], in, n) == 0)
-            [self log:[NSString stringWithFormat:@"The %d takes are NOT merged yet, as chosen. To merge them, on this Mac or another one: "
-                       @"Merge Takes > Open Capture... and choose %@.olddv (it lists the takes; keep all the files together).",
-                       n, [baseName lastPathComponent]]];
-        else
-            [self log:[NSString stringWithFormat:@"The %d takes are not merged, and the list %@.olddv could not be written. "
-                       @"Merge Takes > Open Capture... also accepts %@.dv.", n, [baseName lastPathComponent], [baseName lastPathComponent]]];
-    } else if ([takes count] > 1) {
-        NSString *merged = [baseName stringByAppendingString:@".merged.dv"];
-        const char *in[64];
-        int n = 0;
-        dv_merge_stats ms;
-        [self setState:OVEngineMerging];
-        [self log:[NSString stringWithFormat:@"Merging %lu takes into %@ ...", (unsigned long)[takes count], [merged lastPathComponent]]];
-        for (NSString *t in takes)
-            if (n < 64)
-                in[n++] = [t fileSystemRepresentation];
-        if (dv_merge_files(in, n, [merged fileSystemRepresentation], &ms, NULL, NULL, NULL) == 0) {
-            dv_report mr;
-            dv_report_init(&mr, [merged fileSystemRepresentation]);
-            dv_analyze_file([merged fileSystemRepresentation], &mr, NULL, NULL);
-            dv_report_save_xml([[merged stringByAppendingString:@".dvrescue.xml"] fileSystemRepresentation], &mr);
-            [self log:[NSString stringWithFormat:@"Merged: %u frames: %u without errors in one of the takes, %u repaired by mixing "
-                       @"blocks of several takes (%u blocks), %u still with errors.",
-                       ms.frames_out, ms.frames_ok, ms.frames_repaired, ms.blocks_fixed, ms.frames_still_bad]];
-            dv_report_free(&mr);
-        } else
-            [self log:@"Merge failed."];
-    }
+    [self mergeTakes];
     if (autoStopDeck && deck)
         [deck stop];
     [self finishSession];

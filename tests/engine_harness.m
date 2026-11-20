@@ -184,6 +184,13 @@ int main(int argc, char **argv)
         printf("marks %lu\n", (unsigned long)[pv markCount]);
         return 0;
     }
+    if (argc == 3 && !strcmp(argv[1], "--recover")) {
+        /* finish an interrupted session from its journal */
+        if (![e recoverSession:[NSString stringWithUTF8String:argv[2]]]) { printf("recover: refused\n"); return 1; }
+        do spin(0.1); while ([e state] != OVEngineIdle && [e state] != OVEngineMonitoring);
+        spin(0.3);
+        return 0;
+    }
     if (argc == 9 && !strcmp(argv[1], "--sim"))
         return sim_main(argv);
     if (argc < 5)

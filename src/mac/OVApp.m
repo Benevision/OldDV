@@ -7,6 +7,7 @@
  */
 #import <Cocoa/Cocoa.h>
 #import "OVMovie.h"
+#import "OVShare.h"
 #import "OVEngine.h"
 #import "OVViews.h"
 #import "OVPlayer.h"
@@ -161,6 +162,25 @@ static NSString *fmtBytes(int64_t b)
     return [NSString stringWithFormat:@"%.1f MB", b / 1e6];
 }
 
+/* Views made without a resizing rule keep their place from the top of the
+ * tab (and from the right edge, for those on the right) when the window is
+ * resized; wide fields and tables follow the width. */
+static void OVPinTop(NSView *v)
+{
+    CGFloat W = [v bounds].size.width;
+    for (NSView *sub in [v subviews]) {
+        NSRect f = [sub frame];
+        NSUInteger m = NSViewMinYMargin;
+        if ([sub autoresizingMask] != NSViewNotSizable)
+            continue;
+        if (NSMinX(f) >= W - 190)
+            m |= NSViewMinXMargin;
+        else if (NSMaxX(f) >= W - 175 && f.size.width > 250)
+            m |= NSViewWidthSizable;
+        [sub setAutoresizingMask:m];
+    }
+}
+
 static NSString *fmtDuration(uint64_t frames, int pal)
 {
     double s = pal ? frames / 25.0 : frames * 1001.0 / 30000.0;
@@ -189,6 +209,10 @@ static NSString *fmtDuration(uint64_t frames, int pal)
     size_t graphCopied;
     unsigned graphRevision;
     NSString *lastCapture;
+    NSMutableArray *pendingSessions;  /* journals of interrupted captures still to finish */
+    NSWindow *sharePanel;
+    NSTextField *shareServer, *shareExport, *sharePoint, *shareStatus;
+    NSButton *shareAuto, *shareMountButton;
 
     /* analyze tab */
     NSTextField *analyzePath;
@@ -263,18 +287,15 @@ static void log_to_main(void *ctx, const char *line)
 
     previewBox = [[OVBlackView alloc] initWithFrame:NSMakeRect(12, H - 312, 400, 300)];
     [previewBox setText:@"No device"];
-    [previewBox setAutoresizingMask:NSViewMaxXMargin | NSViewMinYMargin];
     [v addSubview:previewBox];
     [previewBox release];
     dk = v;
     for (i = 0; i < 6; i++) {
         NSButton *b = mkButton(dk, NSMakeRect(8 + i * 68, H - 348, 70, 32), [titles objectAtIndex:i], self, sels[i]);
-        [b setAutoresizingMask:NSViewMinYMargin];
         [btns addObject:b];
     }
     deckButtons = [btns retain];
     deckLabel = mkLabel(v, NSMakeRect(12, H - 372, 400, 18), @"Deck: -");
-    [deckLabel setAutoresizingMask:NSViewMinYMargin];
 
     y = H - 34;
     mkLabel(v, NSMakeRect(x, y, 90, 18), @"Device:");
@@ -300,8 +321,9 @@ static void log_to_main(void *ctx, const char *line)
     mkButton(v, NSMakeRect(x + 400, y - 6, 100, 32), @"Choose...", self, @selector(chooseFolder:));
     y -= 30;
     mkLabel(v, NSMakeRect(x, y, 90, 18), @"File name:");
-    nameField = mkField(v, NSMakeRect(x + 95, y - 2, 300, 22), [self defaultName]);
-    mkLabel(v, NSMakeRect(x + 400, y, 60, 18), @".dv");
+    nameField = mkField(v, NSMakeRect(x + 95, y - 2, 268, 22), [self defaultName]);
+    mkLabel(v, NSMakeRect(x + 367, y, 30, 18), @".dv");
+    mkButton(v, NSMakeRect(x + 400, y - 6, 100, 32), @"NFS Share...", self, @selector(showSharePanel:));
     y -= 30;
     autoPlayCheck = mkCheck(v, NSMakeRect(x, y, 450, 20), @"Rewind not needed - play the tape when capture starts, stop at the end",
                             [defs boolForKey:@"autoplay"]);
@@ -343,7 +365,21 @@ static void log_to_main(void *ctx, const char *line)
     [liveGraph setEmptyText:@"Errors of the capture appear here: red = video blocks concealed, orange = audio errors, blue = new recording, yellow = time code break. Move the mouse over it for details."];
     [v addSubview:liveGraph];
     [liveGraph release];
-    captureLog = mkTextView(v, NSMakeRect(12, 12, W - 24, 98), NSViewWidthSizable | NSViewHeightSizable);
+    captureLog = mkTextView(v, NSMakeRect(12, 12, W - 24, 98), NSViewWidthSizable);
+    /* A larger window gives a larger picture: the preview takes all the
+     * room that is added, the settings stay at the top right, the deck
+     * buttons, the timeline and the log stay at the bottom. */
+    for (NSView *sub in [v subviews]) {
+        NSRect f = [sub frame];
+        if (sub == previewBox)
+            [sub setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+        else if (sub == liveGraph || sub == [captureLog enclosingScrollView])
+            [sub setAutoresizingMask:NSViewWidthSizable];
+        else if (NSMinX(f) >= x && NSMinY(f) >= 238)
+            [sub setAutoresizingMask:NSViewMinXMargin | NSViewMinYMargin];
+        else
+            [sub setAutoresizingMask:NSViewNotSizable];
+    }
 }
 
 - (OVEngineChoice)engineChoice { return (OVEngineChoice)[enginePopup indexOfSelectedItem]; }
@@ -480,6 +516,200 @@ static BOOL OVFolderIsRemote(NSString *folder)
                                 [self cacheFolder], [left componentsJoinedByString:@", "]]);
 }
 
+/* ---------------- NFS share ---------------- */
+
+- (NSString *)sharePointPath { return [[defs stringForKey:@"nfs_point"] stringByStandardizingPath]; }
+
+/* YES when path is inside the folder where the share is mounted */
+- (BOOL)pathIsOnShare:(NSString *)path
+{
+    NSString *pt = [self sharePointPath];
+    path = [path stringByStandardizingPath];
+    return [pt length] > 1 && ([path isEqualToString:pt] || [path hasPrefix:[pt stringByAppendingString:@"/"]]);
+}
+
+- (void)updateShareStatus
+{
+    NSString *pt = [self sharePointPath];
+    [shareStatus setStringValue:OVShareIsMounted(pt) ? [NSString stringWithFormat:@"Mounted on %@.", pt]
+                                                     : @"Not mounted."];
+}
+
+- (void)saveShareFields
+{
+    if (!sharePanel)
+        return;
+    [defs setObject:[[shareServer stringValue] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]] forKey:@"nfs_server"];
+    [defs setObject:[shareExport stringValue] forKey:@"nfs_export"];
+    [defs setObject:[sharePoint stringValue] forKey:@"nfs_point"];
+    [defs setBool:[shareAuto state] == NSOnState forKey:@"nfs_auto"];
+}
+
+/* waits for the mount; nil when the share is there */
+- (NSString *)mountShareNow
+{
+    NSString *err;
+    [self saveShareFields];
+    if (OVShareIsMounted([self sharePointPath]))
+        return nil;
+    appendText(captureLog, [NSString stringWithFormat:@"Mounting %@:%@ on %@ (NFS 3, TCP, privileged port)...",
+                            [defs stringForKey:@"nfs_server"], [defs stringForKey:@"nfs_export"], [self sharePointPath]]);
+    err = OVShareMount([defs stringForKey:@"nfs_server"], [defs stringForKey:@"nfs_export"], [defs stringForKey:@"nfs_point"]);
+    appendText(captureLog, err ? err : @"The share is mounted.");
+    [self updateShareStatus];
+    return err;
+}
+
+- (void)shareMountDone:(NSString *)err
+{
+    appendText(captureLog, [err length] ? err : @"The share is mounted.");
+    [shareMountButton setEnabled:YES];
+    [self updateShareStatus];
+    if ([err length])
+        [shareStatus setStringValue:err];
+    else
+        [self offerRecovery];
+}
+
+- (void)shareMountThread:(NSArray *)a
+{
+    NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+    NSString *err = OVShareMount([a objectAtIndex:0], [a objectAtIndex:1], [a objectAtIndex:2]);
+    [self performSelectorOnMainThread:@selector(shareMountDone:) withObject:err ? err : @"" waitUntilDone:NO];
+    [pool release];
+}
+
+/* mounts in the background: the window stays usable */
+- (void)mountShareInBackground
+{
+    [self saveShareFields];
+    if (OVShareIsMounted([self sharePointPath])) {
+        [self updateShareStatus];
+        return;
+    }
+    [shareMountButton setEnabled:NO];
+    [shareStatus setStringValue:@"Mounting... (the system may ask for an administrator password)"];
+    appendText(captureLog, [NSString stringWithFormat:@"Mounting %@:%@ on %@ (NFS 3, TCP, privileged port)...",
+                            [defs stringForKey:@"nfs_server"], [defs stringForKey:@"nfs_export"], [self sharePointPath]]);
+    [NSThread detachNewThreadSelector:@selector(shareMountThread:) toTarget:self
+                           withObject:[NSArray arrayWithObjects:[defs stringForKey:@"nfs_server"], [defs stringForKey:@"nfs_export"],
+                                       [defs stringForKey:@"nfs_point"], nil]];
+}
+
+- (void)shareMount:(id)s
+{
+    NSString *bad;
+    [self saveShareFields];
+    bad = OVShareCheck([defs stringForKey:@"nfs_server"], [defs stringForKey:@"nfs_export"], [defs stringForKey:@"nfs_point"]);
+    if (bad) {
+        [shareStatus setStringValue:bad];
+        return;
+    }
+    [self mountShareInBackground];
+}
+
+- (void)shareClose:(id)s
+{
+    [self saveShareFields];
+    [sharePanel orderOut:nil];
+}
+
+- (void)showSharePanel:(id)s
+{
+    if (!sharePanel) {
+        NSView *v;
+        CGFloat W = 560, H = 250, y = H - 62;
+        sharePanel = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, W, H)
+                                                 styleMask:NSTitledWindowMask | NSClosableWindowMask
+                                                   backing:NSBackingStoreBuffered defer:NO];
+        [sharePanel setReleasedWhenClosed:NO];
+        [sharePanel setTitle:@"NFS share (Unraid or another NAS)"];
+        v = [sharePanel contentView];
+        mkLabel(v, NSMakeRect(16, H - 44, W - 32, 34),
+                @"Mounts the share the way Mac OS X 10.6 needs it: NFS version 3 over TCP, from a privileged port. "
+                @"The system may ask for an administrator password.");
+        y -= 34;
+        mkLabel(v, NSMakeRect(16, y, 150, 18), @"Server:");
+        shareServer = mkField(v, NSMakeRect(170, y - 2, W - 186, 22), [defs stringForKey:@"nfs_server"]);
+        y -= 30;
+        mkLabel(v, NSMakeRect(16, y, 150, 18), @"Share, path on server:");
+        shareExport = mkField(v, NSMakeRect(170, y - 2, W - 186, 22), [defs stringForKey:@"nfs_export"]);
+        y -= 30;
+        mkLabel(v, NSMakeRect(16, y, 150, 18), @"Folder on this Mac:");
+        sharePoint = mkField(v, NSMakeRect(170, y - 2, W - 186, 22), [defs stringForKey:@"nfs_point"]);
+        y -= 28;
+        shareAuto = mkCheck(v, NSMakeRect(168, y, W - 184, 20), @"Mount it when OldDV Rescue starts and before a capture",
+                            [defs boolForKey:@"nfs_auto"]);
+        shareMountButton = mkButton(v, NSMakeRect(10, 10, 130, 32), @"Mount Now", self, @selector(shareMount:));
+        mkButton(v, NSMakeRect(W - 110, 10, 100, 32), @"Close", self, @selector(shareClose:));
+        shareStatus = mkLabel(v, NSMakeRect(148, 8, W - 264, 34), @"");
+        [sharePanel center];
+    }
+    [self updateShareStatus];
+    [sharePanel makeKeyAndOrderFront:nil];
+}
+
+/* ---------------- interrupted captures ---------------- */
+
+- (void)findInterruptedSessions
+{
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *folder = [[defs stringForKey:@"folder"] stringByExpandingTildeInPath];
+    NSMutableArray *dirs = [NSMutableArray arrayWithObject:[self cacheFolder]];
+    /* captures recorded straight into a folder of this Mac; a share is not searched (it may hang) */
+    if ([folder length] && ![self pathIsOnShare:folder] && ![folder hasPrefix:@"/Volumes/"])
+        [dirs addObject:folder];
+    if (!pendingSessions)
+        pendingSessions = [[NSMutableArray alloc] init];
+    [pendingSessions removeAllObjects];
+    for (NSString *d in dirs)
+        for (NSString *n in [[fm contentsOfDirectoryAtPath:d error:NULL] sortedArrayUsingSelector:@selector(compare:)])
+            if ([[n pathExtension] isEqualToString:@"session"]) {
+                NSString *p = [d stringByAppendingPathComponent:n];
+                if ([OVEngine readSession:p] && ![pendingSessions containsObject:p])
+                    [pendingSessions addObject:p];
+            }
+}
+
+/* asks about the next interrupted capture, one at a time */
+- (void)offerRecovery
+{
+    while ([pendingSessions count] && ([engine state] == OVEngineIdle || [engine state] == OVEngineMonitoring)) {
+        NSString *p = [[[pendingSessions objectAtIndex:0] retain] autorelease];
+        NSDictionary *info = [OVEngine readSession:p];
+        NSString *dest = [info objectForKey:@"dest"], *phase = [info objectForKey:@"phase"];
+        BOOL isDir = NO;
+        NSInteger r;
+        [pendingSessions removeObjectAtIndex:0];
+        if (!info)
+            continue;
+        r = NSRunAlertPanel(@"Unfinished capture",
+            @"The capture \"%@\" was interrupted while %@ (power cut, crash, or the copy was stopped).\n\n"
+            @"OldDV Rescue can finish it from what is on the disk: write the reports, %@%@. "
+            @"The recording itself is not changed, and nothing is read from the tape.",
+            @"Finish Now", @"Later", nil, [info objectForKey:@"name"], phase,
+            [[info objectForKey:@"merge_later"] intValue] ? @"list the takes for a later merge" : @"merge the takes",
+            [dest length] ? [NSString stringWithFormat:@", and copy everything to %@", dest] : @"");
+        if (r != NSAlertDefaultReturn) {
+            appendText(captureLog, [NSString stringWithFormat:@"The interrupted capture %@ stays in %@. OldDV Rescue asks again at its next start.",
+                                    [info objectForKey:@"name"], [p stringByDeletingLastPathComponent]]);
+            continue;
+        }
+        if ([dest length] && [self pathIsOnShare:dest] && !OVShareIsMounted([self sharePointPath]))
+            [self mountShareNow];
+        if ([dest length] && (([self pathIsOnShare:dest] && !OVShareIsMounted([self sharePointPath]))
+                              || ![[NSFileManager defaultManager] fileExistsAtPath:dest isDirectory:&isDir] || !isDir)) {
+            NSRunAlertPanel(@"Folder not available",
+                @"%@ cannot be reached now (is the share mounted?). The capture stays safe on this Mac in %@. "
+                @"Start OldDV Rescue again when the folder is back.", @"OK", nil, nil, dest, [p stringByDeletingLastPathComponent]);
+            continue;
+        }
+        [tabs selectTabViewItemAtIndex:0];
+        if ([engine recoverSession:p])
+            return; /* the next one is offered when this one is done */
+    }
+}
+
 - (void)toggleCapture:(id)s
 {
     OVEngineState st = [engine state];
@@ -509,6 +739,13 @@ static BOOL OVFolderIsRemote(NSString *folder)
         name = [self defaultName];
     if ([[name pathExtension] isEqualToString:@"dv"])
         name = [name stringByDeletingPathExtension];
+    /* The folder is on the NFS share: it must be mounted, else the capture
+     * would land in an ordinary folder of the same name on the boot disk. */
+    if ([self pathIsOnShare:folder] && !OVShareIsMounted([self sharePointPath]) && [self mountShareNow]) {
+        NSRunAlertPanel(@"Share not mounted", @"%@ is on the NFS share, and the share could not be mounted. See the log, "
+                        @"or click NFS Share... to check its settings.", @"OK", nil, nil, folder);
+        return;
+    }
     if (![folder length] || ![[NSFileManager defaultManager] createDirectoryAtPath:folder withIntermediateDirectories:YES attributes:nil error:NULL]) {
         NSRunAlertPanel(@"Folder", @"Choose a folder to save the capture.", @"OK", nil, nil);
         return;
@@ -603,6 +840,8 @@ static BOOL OVFolderIsRemote(NSString *folder)
         [nameField setStringValue:[self defaultName]];
     if (wasRunning && !running)
         [self exportAfterCapture];
+    if (wasRunning && !running && [pendingSessions count])
+        [self performSelector:@selector(offerRecovery) withObject:nil afterDelay:0.5];
     wasRunning = running;
 }
 
@@ -1154,7 +1393,7 @@ static BOOL OVFolderIsRemote(NSString *folder)
 - (void)mergeMade:(NSString *)out
 {
     [packInField setStringValue:out];
-#ifdef OV_TEST_AUTOMERGE
+#ifdef OV_TEST_HOOKS
     busy = NO;
     [tabs selectTabViewItemAtIndex:1];
     [self analyzeFile:out];
@@ -1561,6 +1800,7 @@ static BOOL OVFolderIsRemote(NSString *folder)
     [edit addItemWithTitle:@"Select All" action:@selector(selectAll:) keyEquivalent:@"a"];
     [editItem setSubmenu:edit];
     [win addItemWithTitle:@"Minimize" action:@selector(performMiniaturize:) keyEquivalent:@"m"];
+    [win addItemWithTitle:@"Zoom" action:@selector(performZoom:) keyEquivalent:@""];
     [winItem setSubmenu:win];
     [NSApp setMainMenu:bar];
     [NSApp setWindowsMenu:win];
@@ -1583,7 +1823,8 @@ static BOOL OVFolderIsRemote(NSString *folder)
     NSUInteger i;
     NSDictionary *def = [NSDictionary dictionaryWithObjectsAndKeys:
                          [@"~/Movies/DV Captures" stringByExpandingTildeInPath], @"folder",
-                         @"5", @"timeout", [NSNumber numberWithBool:YES], @"autoplay", nil];
+                         @"5", @"timeout", [NSNumber numberWithBool:YES], @"autoplay",
+                         @"tower.local", @"nfs_server", @"/mnt/user/New Share", @"nfs_export", @"/Volumes/Unraid", @"nfs_point", nil];
     defs = [NSUserDefaults standardUserDefaults];
     [defs registerDefaults:def];
     mergeInputs = [[NSMutableArray alloc] init];
@@ -1613,6 +1854,8 @@ static BOOL OVFolderIsRemote(NSString *folder)
         case 2: [self buildMergeTab:v]; break;
         case 3: [self buildPackageTab:v]; break;
         }
+        if (i > 0)
+            OVPinTop(v);
     }
     [window center];
     [window makeKeyAndOrderFront:nil];
@@ -1621,7 +1864,9 @@ static BOOL OVFolderIsRemote(NSString *folder)
     appendText(captureLog, [NSString stringWithFormat:@"OldDV Rescue %@ - capture engines: %@%@", OLDDV_VERSION_NS,
                             [OVCaptureBackend qtKitAvailable] ? @"QTKit " : @"",
                             [OVCaptureBackend avFoundationAvailable] ? @"AVFoundation" : @""]);
-    [self reportCacheLeftovers];
+    [self findInterruptedSessions];
+    if (![pendingSessions count])
+        [self reportCacheLeftovers];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(deviceNotification:) name:@"QTCaptureDeviceWasConnectedNotification" object:nil];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(deviceNotification:) name:@"QTCaptureDeviceWasDisconnectedNotification" object:nil];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(deviceNotification:) name:@"AVCaptureDeviceWasConnectedNotification" object:nil];
@@ -1636,14 +1881,31 @@ static BOOL OVFolderIsRemote(NSString *folder)
         [tabs selectTabViewItemAtIndex:2];
     }
 #endif
+    /* the share first (an interrupted capture may have to be copied to it), then the recovery */
+    if ([defs boolForKey:@"nfs_auto"] && !OVShareIsMounted([self sharePointPath])
+        && !OVShareCheck([defs stringForKey:@"nfs_server"], [defs stringForKey:@"nfs_export"], [defs stringForKey:@"nfs_point"]))
+        [self mountShareInBackground];
+    else
+        [self performSelector:@selector(offerRecovery) withObject:nil afterDelay:0.5];
     if (pendingOpen) {
         [self loadCapture:pendingOpen];
         [pendingOpen release];
         pendingOpen = nil;
-#ifdef OV_TEST_AUTOMERGE /* test builds: merge without a click, then analyze the result */
+#ifdef OV_TEST_HOOKS /* test builds: merge without a click, then analyze the result */
         [self mergeRun:nil];
 #endif
     }
+#ifdef OV_TEST_HOOKS /* test builds: window size and tab from the environment, to check the layout */
+    if (getenv("OV_TEST_SIZE")) {
+        int tw = 1000, th = 720;
+        sscanf(getenv("OV_TEST_SIZE"), "%dx%d", &tw, &th);
+        [window setFrame:NSMakeRect(40, 60, tw, th) display:YES];
+    }
+    if (getenv("OV_TEST_TAB"))
+        [tabs selectTabViewItemAtIndex:atoi(getenv("OV_TEST_TAB"))];
+    if (getenv("OV_TEST_SHARE"))
+        [self showSharePanel:nil];
+#endif
     timer = [[NSTimer scheduledTimerWithTimeInterval:0.25 target:self selector:@selector(tick:) userInfo:nil repeats:YES] retain];
     [[NSRunLoop currentRunLoop] addTimer:timer forMode:NSModalPanelRunLoopMode];
     [[NSRunLoop currentRunLoop] addTimer:timer forMode:NSEventTrackingRunLoopMode];

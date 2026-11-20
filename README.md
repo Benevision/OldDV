@@ -29,7 +29,7 @@ retrying a bad section during the first pass: the re-reads run as passes after i
 
 ### Option A: prebuilt app
 
-1. Copy `dist/OldDV-Rescue-1.4.1-mac.zip` to the Mac and double-click it.
+1. Copy `dist/OldDV-Rescue-1.5.0-mac.zip` to the Mac and double-click it.
 2. Drag **OldDV Rescue.app** to *Applications*.
 3. On 10.6 it just opens. On 10.8+ Gatekeeper may say the app is from an unidentified
    developer: right-click (Ctrl-click) the app, choose **Open**, then confirm once.
@@ -130,9 +130,25 @@ The log gets a progress line every 5 minutes and a line when a blank section sta
 ends. While the tape is blank, the status shows `REC, blank 130/360 s`: the seconds without
 a picture, and the limit at which the capture finishes by itself if the deck keeps playing.
 
-If the app or the Mac dies during a capture, the `.dv` is still good up to the last data
-written. Only the XML report is missing: open the file in the *Analyze* tab, or run
-`olddv name.dv -x name.dv.dvrescue.xml`.
+**After a power cut or a crash.** During a capture a small file `name.session` next to the
+recording says what the capture was doing. When OldDV Rescue starts and finds one, it
+offers to finish that capture from what is on the disk: it writes the missing reports
+(and tells the time code the recording reached), merges the takes or lists them for a
+later merge, and copies everything to its folder, mounting the NFS share first if
+needed. The recording itself is not changed and nothing is read from the tape; to get
+the rest of a tape, capture it again from a little before that time code under another
+name and join both with *Merge Takes*. The same happens for a capture whose copy to the
+share was stopped or failed. Choose *Later* to be asked again at the next start.
+
+**When the camcorder stops sending.** After many wind and play cycles a camcorder's DV
+stream can stop although the deck still plays. When the deck plays and no data arrives
+for 8 seconds, OldDV Rescue restarts its capture connection, up to three times, and says
+so in the log. If nothing helps, switch the camcorder off and on. During the re-reads,
+four sections in a row that cannot be reached end the re-reads instead of winding the
+tape for nothing; what was read is kept.
+
+**Window.** Enlarge the window (or *Window > Zoom*) for a larger live picture: the preview
+takes all the room that is added.
 
 The raw `.dv` is your preservation master. Keep it even if you make a merged or packaged
 version.
@@ -246,23 +262,25 @@ turns off by default. Three ways around it, best first:
   2. *Shares → (your share) → NFS Security Settings*: set *Export* to **Yes**.
   3. Set *Security* to **Public**, or **Private** with the rule
      `192.168.1.50(sec=sys,rw,insecure)`, using your Mac's IP address.
-* On the Mac:
-  1. In Finder, choose *Go → Connect to Server…* (⌘K).
-  2. Enter `nfs://tower.local/mnt/user/YourShare`, using your server's name or IP. The
-     share appears under `/Volumes/YourShare`.
-  3. In OldDV Rescue, set *Save to* to that folder.
-* To mount it automatically at every start-up: open *Disk Utility → File → NFS Mounts…*,
-  click **+**, enter `nfs://tower.local/mnt/user/YourShare`, and set the mount location
-  to `/Volumes/YourShare`.
-* If the mount fails with a permission error, mount it from Terminal using a privileged
-  port:
+* On the Mac, in OldDV Rescue: click **NFS Share...** on the Capture tab, enter the server
+  (`tower.local` or its IP address), the share as its path on the server
+  (`/mnt/user/YourShare`, capitals and spaces exactly as on the server) and the folder on
+  the Mac (`/Volumes/Unraid`), then click **Mount Now**. The app mounts it the way 10.6
+  needs: NFS version 3 over TCP from a privileged port. Mac OS X may ask for an
+  administrator password in its own dialog. Then set *Save to* to a folder inside
+  `/Volumes/Unraid`.
+* Tick *Mount it when OldDV Rescue starts and before a capture* to have that done by
+  itself. If the folder you save to is on the share and the share cannot be mounted, the
+  capture does not start: otherwise it would land in an ordinary folder of the same name
+  on the boot disk.
+* The same by hand, in Terminal:
 
   ```bash
-  sudo mkdir -p /Volumes/YourShare
+  sudo mkdir -p /Volumes/Unraid
   ```
 
   ```bash
-  sudo mount -t nfs -o resvport,rw tower.local:/mnt/user/YourShare /Volumes/YourShare
+  sudo mount -t nfs -o vers=3,tcp,resvport,rw "tower.local:/mnt/user/YourShare" /Volumes/Unraid
   ```
 
 **2. SMB1.** Unraid 6 can turn on SMB1 for old clients: *Settings → SMB → Enable NetBIOS:
@@ -381,7 +399,7 @@ src/core/      portable C: DV analysis (dvanalyze.c), XML/CSV report (dvreport.c
                copy for slow/network disks (dvwriter.c, dvmirror.c)
 src/cli/       olddv command line tool
 src/mac/       Cocoa app: OVApp (window), OVEngine (capture + retries), OVCapture
-               (QTKit / AVFoundation), OVDeck (AV/C control), OVViews (timeline, block map, picture with
+               (QTKit / AVFoundation), OVDeck (AV/C control), OVShare (NFS mount), OVViews (timeline, block map, picture with
                error marks), OVPlayer (player window), OVMovie (picture through QTKit or AVFoundation)
 tests/         damage injector, comparison with DVRescue, self test
 tools/         cross build, icon
